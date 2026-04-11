@@ -1,2 +1,10 @@
-[build]
-target-dir = "C:/Users/egorb/codex-target/GatoMQTT"
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/esp-rs/esp-pacs?rev=5d7a479"]
+git = "https://github.com/esp-rs/esp-pacs"
+rev = "5d7a479"
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor/cargo"

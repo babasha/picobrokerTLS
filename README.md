@@ -29,6 +29,25 @@ Compared to the original minimal broker shape, this version adds:
 
 The current ESP32-C3 example uses `TLS 1.3 + pure PSK`, which keeps handshake cost lower than X.509 on small MCUs and matches a closed-infrastructure deployment model.
 
+## Offline Dependency Layout
+
+This repository is set up to build without reaching crates.io or Git once the required Rust toolchains are already installed locally.
+
+- the custom `mbedtls-rs` fork is stored in [`vendor/mbedtls-rs`](./vendor/mbedtls-rs)
+- the pinned `esp-hal` fork is stored in [`third_party/esp-hal`](./third_party/esp-hal)
+- Cargo registry and git dependencies are vendored in [`vendor/cargo`](./vendor/cargo)
+- source replacement is configured in [`.cargo/config.toml`](./.cargo/config.toml)
+
+To verify the dependency side is offline-capable, build with `--offline`, for example:
+
+```bash
+cargo build --offline --locked
+cd examples/esp32c3_mqtt_server
+cargo build --offline --locked --features tls
+```
+
+This does not install the Rust toolchain or ESP target for you. Those still need to exist on the machine beforehand.
+
 ## Features
 
 - `no_std` broker core
@@ -102,7 +121,7 @@ cd examples/tokio_mqtt_server
 cargo run
 ```
 
-The embedded examples require their respective toolchains and board setup. The ESP32-C3 TLS example is self-contained and uses the vendored `mbedtls-rs` workspace from [`vendor/mbedtls-rs`](./vendor/mbedtls-rs).
+The embedded examples require their respective toolchains and board setup. The ESP32-C3 TLS example is self-contained and uses the vendored `mbedtls-rs` workspace from [`vendor/mbedtls-rs`](./vendor/mbedtls-rs), the local `esp-hal` fork from [`third_party/esp-hal`](./third_party/esp-hal), and the Cargo source mirror in [`vendor/cargo`](./vendor/cargo).
 
 ## Repository Layout
 

@@ -4,13 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [patch.crates-io]
-esp-rtos = { git = "https://github.com/esp-rs/esp-hal", rev = "8a9fd5e" }
-esp-hal = { git = "https://github.com/esp-rs/esp-hal", rev = "8a9fd5e" }
-esp-alloc = { git = "https://github.com/esp-rs/esp-hal", rev = "8a9fd5e" }
-esp-backtrace = { git = "https://github.com/esp-rs/esp-hal", rev = "8a9fd5e" }
-esp-println = { git = "https://github.com/esp-rs/esp-hal", rev = "8a9fd5e" }
-esp-radio = { git = "https://github.com/esp-rs/esp-hal", rev = "8a9fd5e" }
-esp-bootloader-esp-idf = { git = "https://github.com/esp-rs/esp-hal", rev = "8a9fd5e" }
+esp-rtos = { path = "../../third_party/esp-hal/esp-rtos" }
+esp-hal = { path = "../../third_party/esp-hal/esp-hal" }
+esp-alloc = { path = "../../third_party/esp-hal/esp-alloc" }
+esp-backtrace = { path = "../../third_party/esp-hal/esp-backtrace" }
+esp-println = { path = "../../third_party/esp-hal/esp-println" }
+esp-radio = { path = "../../third_party/esp-hal/esp-radio" }
+esp-bootloader-esp-idf = { path = "../../third_party/esp-hal/esp-bootloader-esp-idf" }
+esp-metadata-generated = { path = "../../third_party/esp-hal/esp-metadata-generated" }
 
 [dependencies]
 gatomqtt = { package = "GatoMQTT", path = "../../" }

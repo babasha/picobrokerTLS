@@ -8,5 +8,13 @@ target/
 .claude/
 .codex/
 
-# Vendored private C library — clone separately (see vendor/README.md)
+# Vendored Cargo dependencies (cargo vendor vendor/cargo).
+# Excluded from git — too large (~20 k files). Run `cargo vendor vendor/cargo`
+# on a network-connected machine and keep the output locally for offline builds.
+vendor/cargo/
+
+# Private C library wrapper — obtain separately (see vendor/README.md)
 vendor/mbedtls-rs/
+
+# Third-party source trees checked out for local development
+third_party/

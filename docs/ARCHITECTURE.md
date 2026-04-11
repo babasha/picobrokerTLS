@@ -95,6 +95,17 @@ The ESP32-C3 example is the main reference:
 
 That split keeps broker logic independent from any specific TLS stack.
 
+## Dependency Strategy
+
+The repository is intended to be self-contained at the source level.
+
+- the broker core stays independent from any TLS backend
+- the custom `mbedtls-rs` fork lives in [`../vendor/mbedtls-rs`](../vendor/mbedtls-rs)
+- the pinned `esp-hal` fork lives in [`../third_party/esp-hal`](../third_party/esp-hal)
+- Cargo registry and git sources are mirrored in [`../vendor/cargo`](../vendor/cargo)
+
+This keeps the repo suitable both as a standalone workbench and as a library subtree that can later be embedded into a larger firmware codebase.
+
 ## Tuning Knobs
 
 The first place to tune runtime limits is [`src/config.rs`](../src/config.rs).
