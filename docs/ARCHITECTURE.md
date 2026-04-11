@@ -91,7 +91,7 @@ The ESP32-C3 example is the main reference:
 - the app owns the TLS context and socket lifecycle
 - the broker still sees only a transport
 - the TLS example uses `TLS 1.3 + pure PSK`
-- the companion `mbedtls-rs` fork shares one prepared TLS config across many sessions
+- the vendored `mbedtls-rs` fork shares one prepared TLS config across many sessions
 
 That split keeps broker logic independent from any specific TLS stack.
 

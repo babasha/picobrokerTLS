@@ -4,7 +4,7 @@ use crate::handler::connect::{prepare_connect, write_connack, HouseToken, Prepar
 use crate::handler::disconnect::{publish_lwt_if_needed, LwtBroadcaster, LwtBroadcastError};
 use crate::handler::pingreq::touch_pingreq;
 use crate::handler::publish::{
-    handle_puback, handle_publish, process_inflight_retries, InboundQueue, PublishError,
+    handle_puback, handle_publish, process_inflight_retries, MqttIntent, PublishError,
 };
 use crate::handler::subscribe::{
     apply_unsubscribe, prepare_subscribe, write_prepared_subscribe,
@@ -17,6 +17,7 @@ use crate::transport::Transport;
 use core::cell::RefCell;
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::RawMutex;
+use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use heapless::Vec;
@@ -74,7 +75,7 @@ pub async fn connection_loop<
     transport: &mut T,
     registry: &Mutex<M, SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>>,
     retained: &Mutex<M, RetainedStore<MAX_RETAINED>>,
-    inbound_queue: &Mutex<M, InboundQueue<INBOUND_N>>,
+    inbound_queue: &Channel<M, MqttIntent, INBOUND_N>,
     config: &BrokerConfig,
     frame_buf: &mut [u8; MAX_PACKET_SIZE],
 ) {
@@ -178,9 +179,21 @@ pub async fn connection_loop<
             }
         }
 
+        let timer_after = {
+            let registry = registry.lock().await;
+            let Some(session) = registry.get(session_id) else {
+                break;
+            };
+            session.next_wakeup_after(
+                embassy_time::Instant::now(),
+                config.qos1_retry_ms,
+                Duration::from_millis(50),
+            )
+        };
+
         match select(
             read_packet(transport, frame_buf),
-            Timer::after(Duration::from_millis(50)),
+            Timer::after(timer_after),
         )
         .await
         {
@@ -433,12 +446,13 @@ fn encode_publish_from_lwt(
 mod tests {
     use super::connection_loop;
     use crate::config::BrokerConfig;
-    use crate::handler::publish::InboundQueue;
+    use crate::handler::publish::MqttIntent;
     use crate::router::RetainedStore;
     use crate::session::registry::SessionRegistry;
     use crate::session::state::{InflightEntry, SessionState, Subscription};
     use crate::transport::Transport;
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use embassy_sync::channel::Channel;
     use embassy_sync::mutex::Mutex;
     use embassy_time::{Duration, Instant};
     use futures::executor::block_on;
@@ -633,7 +647,7 @@ mod tests {
 
         let registry = Mutex::<CriticalSectionRawMutex, _>::new(SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new());
         let retained = Mutex::<CriticalSectionRawMutex, _>::new(RetainedStore::<MAX_RETAINED>::new());
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<INBOUND_N>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, INBOUND_N>::new();
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
 
         block_on(connection_loop(
@@ -662,7 +676,7 @@ mod tests {
 
         let registry = Mutex::<CriticalSectionRawMutex, _>::new(SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new());
         let retained = Mutex::<CriticalSectionRawMutex, _>::new(RetainedStore::<MAX_RETAINED>::new());
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<INBOUND_N>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, INBOUND_N>::new();
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
 
         block_on(connection_loop(
@@ -688,7 +702,7 @@ mod tests {
 
         let registry = Mutex::<CriticalSectionRawMutex, _>::new(SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new());
         let retained = Mutex::<CriticalSectionRawMutex, _>::new(RetainedStore::<MAX_RETAINED>::new());
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<INBOUND_N>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, INBOUND_N>::new();
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
 
         block_on(connection_loop(
@@ -737,7 +751,7 @@ mod tests {
             thread::sleep(StdDuration::from_millis(10));
         });
 
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<INBOUND_N>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, INBOUND_N>::new();
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
 
         block_on(connection_loop(
@@ -782,7 +796,7 @@ mod tests {
 
         let registry = Mutex::<CriticalSectionRawMutex, _>::new(SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new());
         let retained = Mutex::<CriticalSectionRawMutex, _>::new(RetainedStore::<MAX_RETAINED>::new());
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<INBOUND_N>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, INBOUND_N>::new();
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
 
         block_on(connection_loop(
@@ -835,7 +849,7 @@ mod tests {
             thread::sleep(StdDuration::from_millis(10));
         });
 
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<INBOUND_N>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, INBOUND_N>::new();
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
 
         block_on(connection_loop(
@@ -907,7 +921,7 @@ mod tests {
             thread::sleep(StdDuration::from_millis(10));
         });
 
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<INBOUND_N>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, INBOUND_N>::new();
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
 
         block_on(connection_loop(

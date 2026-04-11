@@ -1,3 +1,7 @@
+pub mod tls;
+#[cfg(feature = "embassy-net")]
+pub mod tcp;
+
 #[allow(async_fn_in_trait)]
 pub trait Transport {
     type Error: core::fmt::Debug;

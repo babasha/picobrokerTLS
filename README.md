@@ -25,7 +25,7 @@ Compared to the original minimal broker shape, this version adds:
 - command-topic fan-in queue for local device automation flows
 - token-bucket rate limiting per session
 - TLS identity storage helpers in [`src/tls/mod.rs`](./src/tls/mod.rs)
-- an ESP32-C3 TLS example wired to a companion `mbedtls-rs` fork
+- an ESP32-C3 TLS example wired to a vendored `mbedtls-rs` fork
 
 The current ESP32-C3 example uses `TLS 1.3 + pure PSK`, which keeps handshake cost lower than X.509 on small MCUs and matches a closed-infrastructure deployment model.
 
@@ -80,7 +80,7 @@ The ESP32-C3 example in [`examples/esp32c3_mqtt_server`](./examples/esp32c3_mqtt
 
 Important details:
 
-- it uses a local fork of `mbedtls-rs`
+- it uses a vendored fork of `mbedtls-rs` stored in [`vendor/mbedtls-rs`](./vendor/mbedtls-rs)
 - it is configured for `TLS 1.3` only
 - it uses `pure PSK` instead of X.509
 - it reuses one prepared `mbedtls_ssl_config` across sessions
@@ -102,7 +102,7 @@ cd examples/tokio_mqtt_server
 cargo run
 ```
 
-The embedded examples require their respective toolchains and board setup. The ESP32-C3 TLS example also depends on the companion `mbedtls-rs` workspace located next to this repository.
+The embedded examples require their respective toolchains and board setup. The ESP32-C3 TLS example is self-contained and uses the vendored `mbedtls-rs` workspace from [`vendor/mbedtls-rs`](./vendor/mbedtls-rs).
 
 ## Repository Layout
 

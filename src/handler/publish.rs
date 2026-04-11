@@ -1,11 +1,11 @@
 use crate::codec::frame::write_packet;
 use crate::config::GATOMQTT_CONFIG;
-use crate::router::{find_subscribers, topic_matches, RetainedStore};
+use crate::router::{find_all_subscribers, find_subscribers, topic_matches, RetainedStore};
 use crate::session::registry::SessionRegistry;
 use crate::session::state::{OutboundPacket, SessionId, SessionState, MAX_OUTBOUND_FRAME_SIZE};
 use crate::transport::Transport;
 use embassy_sync::blocking_mutex::raw::RawMutex;
-use embassy_sync::mutex::Mutex;
+use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant};
 use heapless::{String, Vec};
 use mqttrs::{Pid, Publish, QosPid, QoS};
@@ -20,47 +20,11 @@ pub struct MqttIntent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InboundQueue<const N: usize> {
-    items: Vec<MqttIntent, N>,
-}
-
-impl<const N: usize> Default for InboundQueue<N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<const N: usize> InboundQueue<N> {
-    pub const fn new() -> Self {
-        Self { items: Vec::new() }
-    }
-
-    pub fn try_send(&mut self, intent: MqttIntent) -> Result<(), MqttIntent> {
-        match self.items.push(intent) {
-            Ok(()) => Ok(()),
-            Err(intent) => Err(intent),
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    pub fn get(&self, index: usize) -> Option<&MqttIntent> {
-        self.items.get(index)
-    }
-
-    pub fn try_recv(&mut self) -> Option<MqttIntent> {
-        if self.items.is_empty() {
-            None
-        } else {
-            Some(self.items.remove(0))
-        }
-    }
+pub struct MqttPublish {
+    pub topic: String<128>,
+    pub payload: Vec<u8, 512>,
+    pub qos: QoS,
+    pub retain: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -93,7 +57,7 @@ pub async fn handle_publish<
     sender_id: SessionId,
     registry: &mut SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>,
     retained: &mut RetainedStore<MAX_RETAINED>,
-    inbound_queue: &Mutex<M, InboundQueue<INBOUND_N>>,
+    inbound_queue: &Channel<M, MqttIntent, INBOUND_N>,
     packet: &Publish<'_>,
 ) -> Result<(), PublishError> {
     handle_publish_at(
@@ -119,7 +83,7 @@ async fn handle_publish_at<
     sender_id: SessionId,
     registry: &mut SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>,
     retained: &mut RetainedStore<MAX_RETAINED>,
-    inbound_queue: &Mutex<M, InboundQueue<INBOUND_N>>,
+    inbound_queue: &Channel<M, MqttIntent, INBOUND_N>,
     packet: &Publish<'_>,
     now: Instant,
     max_violations: u8,
@@ -166,7 +130,7 @@ async fn handle_publish_at<
             qos: incoming_qos,
         };
 
-        if inbound_queue.lock().await.try_send(intent).is_err() {
+        if inbound_queue.try_send(intent).is_err() {
             log_inbound_queue_drop();
         }
     }
@@ -212,6 +176,49 @@ pub fn encode_publish_qos0(
     retain: bool,
 ) -> Result<Vec<u8, MAX_OUTBOUND_FRAME_SIZE>, PublishError> {
     encode_publish(topic, payload, QoS::AtMostOnce, retain)
+}
+
+/// Route an outbound publish from the control domain to all matching subscribers.
+///
+/// Unlike `handle_publish`, this function applies no rate limiting and does not
+/// exclude any sender — every session subscribed to the topic receives the message.
+pub fn process_outbound_publish<
+    const MAX_SESSIONS: usize,
+    const MAX_SUBS: usize,
+    const MAX_INFLIGHT: usize,
+    const MAX_RETAINED: usize,
+>(
+    registry: &mut SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>,
+    retained: &mut RetainedStore<MAX_RETAINED>,
+    publish: &MqttPublish,
+) -> Result<(), PublishError> {
+    if publish.retain {
+        retained
+            .set(publish.topic.as_str(), publish.payload.as_slice(), publish.qos)
+            .map_err(map_retained_error)?;
+    }
+
+    let subscribers = find_all_subscribers(registry, publish.topic.as_str());
+    for (session_id, subscriber_qos) in subscribers {
+        let effective_qos = min_qos(publish.qos, subscriber_qos);
+        let bytes = encode_publish(
+            publish.topic.as_str(),
+            publish.payload.as_slice(),
+            effective_qos,
+            publish.retain,
+        )?;
+
+        let Some(session) = registry.get_mut(session_id) else {
+            continue;
+        };
+
+        session
+            .outbox
+            .push(OutboundPacket { bytes })
+            .map_err(|_| PublishError::SubscriberOutboxFull(session_id))?;
+    }
+
+    Ok(())
 }
 
 fn encode_publish(
@@ -357,7 +364,8 @@ fn log_unknown_puback(_packet_id: u16) {
 mod tests {
     use super::{
         handle_puback, handle_publish, handle_publish_at, process_inflight_retries_at,
-        InboundQueue, MqttIntent, RetryDisconnect, UNKNOWN_PUBACK_WARNINGS,
+        process_outbound_publish, MqttIntent, MqttPublish, RetryDisconnect,
+        UNKNOWN_PUBACK_WARNINGS,
     };
     use core::sync::atomic::Ordering;
     use crate::router::RetainedStore;
@@ -366,7 +374,7 @@ mod tests {
     use crate::session::state::{InflightEntry, SessionState, Subscription};
     use crate::transport::mock::MockTransport;
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-    use embassy_sync::mutex::Mutex;
+    use embassy_sync::channel::Channel;
     use embassy_time::Instant;
     use heapless::Vec;
     use heapless::String;
@@ -442,7 +450,7 @@ mod tests {
             .insert(session("b", &[("test/topic", QoS::AtMostOnce)]))
             .unwrap();
         let mut retained = RetainedStore::<MAX_RETAINED>::new();
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<8>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, 8>::new();
 
         futures_lite();
         pollster_block_on(async {
@@ -474,7 +482,7 @@ mod tests {
             .insert(session("b", &[("test/topic", QoS::AtMostOnce)]))
             .unwrap();
         let mut retained = RetainedStore::<MAX_RETAINED>::new();
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<8>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, 8>::new();
 
         pollster_block_on(async {
             handle_publish(
@@ -497,7 +505,7 @@ mod tests {
         let mut registry = SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
         let sender_id = registry.insert(session("a", &[])).unwrap();
         let mut retained = RetainedStore::<MAX_RETAINED>::new();
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<8>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, 8>::new();
 
         pollster_block_on(async {
             handle_publish(
@@ -519,7 +527,7 @@ mod tests {
         let mut registry = SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
         let sender_id = registry.insert(session("a", &[])).unwrap();
         let mut retained = RetainedStore::<MAX_RETAINED>::new();
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<8>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, 8>::new();
 
         pollster_block_on(async {
             handle_publish(
@@ -554,7 +562,7 @@ mod tests {
         let mut registry = SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
         let sender_id = registry.insert(session("a", &[])).unwrap();
         let mut retained = RetainedStore::<MAX_RETAINED>::new();
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<8>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, 8>::new();
 
         retained.set("test/topic", b"one", QoS::AtMostOnce).unwrap();
 
@@ -578,7 +586,7 @@ mod tests {
         let mut registry = SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
         let sender_id = registry.insert(session("a", &[])).unwrap();
         let mut retained = RetainedStore::<MAX_RETAINED>::new();
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<8>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, 8>::new();
 
         pollster_block_on(async {
             handle_publish(
@@ -600,7 +608,7 @@ mod tests {
         let mut registry = SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
         let sender_id = registry.insert(session("a", &[])).unwrap();
         let mut retained = RetainedStore::<MAX_RETAINED>::new();
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<8>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, 8>::new();
 
         pollster_block_on(async {
             handle_publish(
@@ -614,8 +622,7 @@ mod tests {
         })
         .unwrap();
 
-        let inbound = pollster_block_on(inbound.lock());
-        let intent = inbound.get(0).unwrap();
+        let intent = inbound.try_receive().unwrap();
         assert_eq!(intent.topic.as_str(), "sb/house1/device/relay-1/set");
         assert_eq!(intent.payload.as_slice(), b"on");
         assert_eq!(intent.qos, QoS::AtMostOnce);
@@ -626,7 +633,7 @@ mod tests {
         let mut registry = SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
         let sender_id = registry.insert(session("a", &[])).unwrap();
         let mut retained = RetainedStore::<MAX_RETAINED>::new();
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<8>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, 8>::new();
 
         pollster_block_on(async {
             handle_publish(
@@ -640,7 +647,7 @@ mod tests {
         })
         .unwrap();
 
-        assert!(pollster_block_on(inbound.lock()).is_empty());
+        assert!(inbound.try_receive().is_err());
     }
 
     #[test]
@@ -648,8 +655,8 @@ mod tests {
         let mut registry = SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
         let sender_id = registry.insert(session("a", &[])).unwrap();
         let mut retained = RetainedStore::<MAX_RETAINED>::new();
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<1>::new());
-        pollster_block_on(inbound.lock())
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, 1>::new();
+        inbound
             .try_send(MqttIntent {
                 topic: String::<128>::try_from("sb/house1/device/relay-1/set").unwrap(),
                 payload: Vec::<u8, 512>::from_slice(b"existing").unwrap(),
@@ -669,9 +676,9 @@ mod tests {
         })
         .unwrap();
 
-        let inbound = pollster_block_on(inbound.lock());
-        assert_eq!(inbound.len(), 1);
-        assert_eq!(inbound.get(0).unwrap().payload.as_slice(), b"existing");
+        let existing = inbound.try_receive().unwrap();
+        assert_eq!(existing.payload.as_slice(), b"existing");
+        assert!(inbound.try_receive().is_err());
     }
 
     #[test]
@@ -683,7 +690,7 @@ mod tests {
             .unwrap();
         registry.get_mut(sender_id).unwrap().rate = TokenBucket::new(0, 0);
         let mut retained = RetainedStore::<MAX_RETAINED>::new();
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<8>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, 8>::new();
 
         pollster_block_on(async {
             handle_publish_at(
@@ -712,7 +719,7 @@ mod tests {
             .unwrap();
         registry.get_mut(sender_id).unwrap().rate = TokenBucket::new(0, 0);
         let mut retained = RetainedStore::<MAX_RETAINED>::new();
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<8>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, 8>::new();
 
         for _ in 0..49 {
             pollster_block_on(async {
@@ -758,7 +765,7 @@ mod tests {
             .unwrap();
         registry.get_mut(sender_id).unwrap().rate = TokenBucket::new(0, 0);
         let mut retained = RetainedStore::<MAX_RETAINED>::new();
-        let inbound = Mutex::<CriticalSectionRawMutex, _>::new(InboundQueue::<8>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, 8>::new();
 
         pollster_block_on(async {
             handle_publish_at(
@@ -893,6 +900,82 @@ mod tests {
 
         assert_eq!(session.inflight[0].retries, 0);
         assert!(transport.tx_log.is_empty());
+    }
+
+    #[test]
+    fn outbound_publish_routes_to_all_matching_subscribers() {
+        let mut registry = SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
+        let sub_a = registry
+            .insert(session("a", &[("devices/+/temp", QoS::AtMostOnce)]))
+            .unwrap();
+        let sub_b = registry
+            .insert(session("b", &[("devices/kitchen/temp", QoS::AtLeastOnce)]))
+            .unwrap();
+        let mut retained = RetainedStore::<MAX_RETAINED>::new();
+        let publish = MqttPublish {
+            topic: String::<128>::try_from("devices/kitchen/temp").unwrap(),
+            payload: Vec::<u8, 512>::from_slice(b"22").unwrap(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+        };
+
+        process_outbound_publish(&mut registry, &mut retained, &publish).unwrap();
+
+        assert_eq!(registry.get(sub_a).unwrap().outbox.len(), 1);
+        assert_eq!(registry.get(sub_b).unwrap().outbox.len(), 1);
+    }
+
+    #[test]
+    fn outbound_publish_includes_all_sessions_no_sender_exclusion() {
+        // A single session subscribed to the topic: with handle_publish it would be
+        // excluded as the sender, but process_outbound_publish has no sender concept.
+        let mut registry = SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
+        let only_id = registry
+            .insert(session("a", &[("test/topic", QoS::AtMostOnce)]))
+            .unwrap();
+        let mut retained = RetainedStore::<MAX_RETAINED>::new();
+        let publish = MqttPublish {
+            topic: String::<128>::try_from("test/topic").unwrap(),
+            payload: Vec::<u8, 512>::from_slice(b"payload").unwrap(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+        };
+
+        process_outbound_publish(&mut registry, &mut retained, &publish).unwrap();
+
+        assert_eq!(registry.get(only_id).unwrap().outbox.len(), 1);
+    }
+
+    #[test]
+    fn outbound_publish_with_retain_updates_retained_store() {
+        let mut registry = SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
+        let mut retained = RetainedStore::<MAX_RETAINED>::new();
+        let publish = MqttPublish {
+            topic: String::<128>::try_from("devices/kitchen/temp").unwrap(),
+            payload: Vec::<u8, 512>::from_slice(b"22").unwrap(),
+            qos: QoS::AtMostOnce,
+            retain: true,
+        };
+
+        process_outbound_publish(&mut registry, &mut retained, &publish).unwrap();
+
+        assert_eq!(retained.len(), 1);
+        let matches: std::vec::Vec<_> = retained.matching("devices/kitchen/temp").collect();
+        assert_eq!(matches[0].payload.as_slice(), b"22");
+    }
+
+    #[test]
+    fn outbound_publish_with_no_subscribers_is_ok() {
+        let mut registry = SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
+        let mut retained = RetainedStore::<MAX_RETAINED>::new();
+        let publish = MqttPublish {
+            topic: String::<128>::try_from("devices/kitchen/temp").unwrap(),
+            payload: Vec::<u8, 512>::from_slice(b"22").unwrap(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+        };
+
+        assert!(process_outbound_publish(&mut registry, &mut retained, &publish).is_ok());
     }
 
     fn pollster_block_on<F: core::future::Future>(future: F) -> F::Output {

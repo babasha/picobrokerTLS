@@ -13,6 +13,9 @@ readme = "./README.md"
 members = ["."]
 resolver = "2"
 
+[features]
+embassy-net = ["dep:embassy-net"]
+
 [dependencies]
 mqttrs = { version = "0.4", default-features = false }
 heapless = "0.8"
@@ -22,6 +25,7 @@ embassy-futures = "0.1"
 embassy-time = { version = "0.5" }
 defmt = "1.0.1"
 sha2 = { version = "0.10", default-features = false }
+embassy-net = { version = "0.8", features = ["tcp"], optional = true }
 
 [dev-dependencies]
 embassy-time = { version = "0.5", features = ["std", "generic-queue-8"] }

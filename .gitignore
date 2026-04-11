@@ -7,3 +7,6 @@ target/
 # AI
 .claude/
 .codex/
+
+# Vendored private C library — clone separately (see vendor/README.md)
+vendor/mbedtls-rs/

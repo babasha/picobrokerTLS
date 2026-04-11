@@ -38,6 +38,35 @@ pub fn find_subscribers<
     subscribers
 }
 
+pub fn find_all_subscribers<
+    const N: usize,
+    const MAX_SUBS: usize,
+    const MAX_INFLIGHT: usize,
+>(
+    registry: &SessionRegistry<N, MAX_SUBS, MAX_INFLIGHT>,
+    topic: &str,
+) -> Vec<(SessionId, QoS), 16> {
+    let mut subscribers = Vec::<(SessionId, QoS), 16>::new();
+
+    for (session_id, session) in registry.iter() {
+        let mut matched_qos = None;
+        for subscription in &session.subscriptions {
+            if topic_matches(subscription.filter.as_str(), topic) {
+                matched_qos = Some(match matched_qos {
+                    Some(current) => max_qos(current, subscription.qos),
+                    None => subscription.qos,
+                });
+            }
+        }
+
+        if let Some(qos) = matched_qos {
+            let _ = subscribers.push((session_id, qos));
+        }
+    }
+
+    subscribers
+}
+
 fn max_qos(lhs: QoS, rhs: QoS) -> QoS {
     if qos_rank(lhs) >= qos_rank(rhs) {
         lhs
@@ -56,7 +85,7 @@ const fn qos_rank(qos: QoS) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::find_subscribers;
+    use super::{find_all_subscribers, find_subscribers};
     use crate::session::registry::SessionRegistry;
     use crate::session::state::{SessionState, Subscription};
     use heapless::String;
@@ -150,6 +179,35 @@ mod tests {
             .unwrap();
 
         let subscribers = find_subscribers(&registry, "devices/kitchen/temp", sender_id);
+
+        assert!(subscribers.is_empty());
+    }
+
+    #[test]
+    fn find_all_includes_every_matching_session_without_exclusion() {
+        let mut registry = SessionRegistry::<8, 8, 4>::new();
+        let a = registry
+            .insert(session("a", &[("devices/+/temp", QoS::AtMostOnce)]))
+            .unwrap();
+        let b = registry
+            .insert(session("b", &[("devices/kitchen/temp", QoS::AtLeastOnce)]))
+            .unwrap();
+
+        let subscribers = find_all_subscribers(&registry, "devices/kitchen/temp");
+
+        assert_eq!(subscribers.len(), 2);
+        assert!(subscribers.iter().any(|(id, _)| *id == a));
+        assert!(subscribers.iter().any(|(id, _)| *id == b));
+    }
+
+    #[test]
+    fn find_all_returns_empty_when_no_matching_subscribers() {
+        let mut registry = SessionRegistry::<8, 8, 4>::new();
+        let _ = registry
+            .insert(session("a", &[("other/topic", QoS::AtMostOnce)]))
+            .unwrap();
+
+        let subscribers = find_all_subscribers(&registry, "devices/kitchen/temp");
 
         assert!(subscribers.is_empty());
     }

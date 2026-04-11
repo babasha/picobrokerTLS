@@ -114,6 +114,42 @@ impl<const MAX_SUBS: usize, const MAX_INFLIGHT: usize> SessionState<MAX_SUBS, MA
         now > self.keepalive_deadline()
     }
 
+    /// Returns how long the connection loop should sleep before its next wakeup.
+    ///
+    /// Clamps to `max_wait` (the outbox polling interval), then tightens to:
+    /// - the time remaining until keepalive expires, and
+    /// - the time remaining until the earliest inflight QoS-1 retry is due.
+    ///
+    /// Returns at least one tick so the caller always gets a finite duration.
+    pub fn next_wakeup_after(&self, now: Instant, qos1_retry_ms: u32, max_wait: Duration) -> Duration {
+        let mut wait = max_wait;
+
+        if self.keepalive_secs > 0 {
+            let deadline = self.keepalive_deadline();
+            match deadline.checked_duration_since(now) {
+                Some(remaining) => wait = wait.min(remaining),
+                None => return Duration::from_ticks(1),
+            }
+        }
+
+        if !self.inflight.is_empty() {
+            let retry_timeout = Duration::from_millis(qos1_retry_ms as u64);
+            for entry in &self.inflight {
+                let elapsed = now
+                    .checked_duration_since(entry.sent_at)
+                    .unwrap_or(Duration::from_ticks(0));
+                let remaining = if elapsed >= retry_timeout {
+                    Duration::from_ticks(0)
+                } else {
+                    Duration::from_ticks(retry_timeout.as_ticks() - elapsed.as_ticks())
+                };
+                wait = wait.min(remaining);
+            }
+        }
+
+        wait.max(Duration::from_ticks(1))
+    }
+
     pub fn next_packet_id(&mut self) -> u16 {
         self.next_packet_id = self.next_packet_id.wrapping_add(1);
         if self.next_packet_id == 0 {
@@ -144,7 +180,7 @@ impl<const MAX_SUBS: usize, const MAX_INFLIGHT: usize> SessionState<MAX_SUBS, MA
 #[cfg(test)]
 mod tests {
     use super::{InflightEntry, SessionState};
-    use embassy_time::Instant;
+    use embassy_time::{Duration, Instant};
     use heapless::{String, Vec};
     use mqttrs::QoS;
 
@@ -269,6 +305,87 @@ mod tests {
             .collect();
 
         assert_eq!(expired, std::vec![1]);
+    }
+
+    #[test]
+    fn next_wakeup_no_keepalive_returns_max_wait() {
+        let state = SessionState::<32, 16>::new(String::<64>::try_from("client").unwrap(), 0);
+        let now = Instant::from_secs(100);
+        let max_wait = Duration::from_millis(50);
+
+        let wakeup = state.next_wakeup_after(now, 5_000, max_wait);
+
+        assert_eq!(wakeup, max_wait);
+    }
+
+    #[test]
+    fn next_wakeup_keepalive_far_away_returns_max_wait() {
+        let mut state = SessionState::<32, 16>::new(String::<64>::try_from("client").unwrap(), 60);
+        state.update_activity_at(Instant::from_secs(100));
+        let now = Instant::from_secs(100);
+        let max_wait = Duration::from_millis(50);
+
+        let wakeup = state.next_wakeup_after(now, 5_000, max_wait);
+
+        // keepalive deadline = 100 + 90 = 190 s, far away → clamped to max_wait
+        assert_eq!(wakeup, max_wait);
+    }
+
+    #[test]
+    fn next_wakeup_keepalive_close_returns_remaining() {
+        let mut state = SessionState::<32, 16>::new(String::<64>::try_from("client").unwrap(), 60);
+        // deadline = last_activity + 90 s; if now is 89.99 s after last_activity
+        // remaining ≈ 10 ms < 50 ms max_wait
+        state.update_activity_at(Instant::from_millis(0));
+        let now = Instant::from_millis(89_990);
+        let max_wait = Duration::from_millis(50);
+
+        let wakeup = state.next_wakeup_after(now, 5_000, max_wait);
+
+        assert_eq!(wakeup, Duration::from_millis(10));
+    }
+
+    #[test]
+    fn next_wakeup_expired_keepalive_returns_one_tick() {
+        let mut state = SessionState::<32, 16>::new(String::<64>::try_from("client").unwrap(), 60);
+        state.update_activity_at(Instant::from_secs(0));
+        let now = Instant::from_secs(200); // well past 90 s deadline
+
+        let wakeup = state.next_wakeup_after(now, 5_000, Duration::from_millis(50));
+
+        assert_eq!(wakeup, Duration::from_ticks(1));
+    }
+
+    #[test]
+    fn next_wakeup_inflight_retry_closer_than_keepalive_returns_retry_time() {
+        let mut state = SessionState::<32, 16>::new(String::<64>::try_from("client").unwrap(), 60);
+        state.update_activity_at(Instant::from_secs(100));
+        // inflight sent 4.9 s ago, retry timeout = 5 s → 100 ms remaining
+        state
+            .inflight_add(inflight_entry(1, Instant::from_millis(99_900)))
+            .unwrap();
+        let now = Instant::from_millis(100_000);
+        let max_wait = Duration::from_millis(50);
+
+        let wakeup = state.next_wakeup_after(now, 5_000, max_wait);
+
+        // retry remaining = 5000 - 100 = 4900 ms, but capped at 50 ms
+        assert_eq!(wakeup, max_wait);
+    }
+
+    #[test]
+    fn next_wakeup_inflight_retry_overdue_returns_one_tick() {
+        let mut state = SessionState::<32, 16>::new(String::<64>::try_from("client").unwrap(), 60);
+        state.update_activity_at(Instant::from_secs(100));
+        // inflight sent 10 s ago, retry timeout = 5 s → overdue
+        state
+            .inflight_add(inflight_entry(1, Instant::from_millis(90_000)))
+            .unwrap();
+        let now = Instant::from_millis(100_000);
+
+        let wakeup = state.next_wakeup_after(now, 5_000, Duration::from_millis(50));
+
+        assert_eq!(wakeup, Duration::from_ticks(1));
     }
 
     #[test]

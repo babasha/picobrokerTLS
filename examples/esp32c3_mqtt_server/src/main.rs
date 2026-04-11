@@ -16,6 +16,7 @@ use embassy_executor::Spawner;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{IpListenEndpoint, Stack, StackResources};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 #[cfg(feature = "tls")]
 use embassy_sync::signal::Signal;
@@ -29,8 +30,7 @@ use gatomqtt::codec::frame::{read_packet, ReadError};
 use gatomqtt::config::GATOMQTT_CONFIG;
 use gatomqtt::handler::connect::{prepare_connect, write_connack, HouseToken, PreparedConnect};
 use gatomqtt::handler::pingreq::touch_pingreq;
-use gatomqtt::handler::publish::InboundQueue;
-use gatomqtt::handler::publish::{handle_publish, PublishError};
+use gatomqtt::handler::publish::{handle_publish, MqttIntent, PublishError};
 use gatomqtt::handler::subscribe::{
     apply_unsubscribe, prepare_subscribe, write_prepared_subscribe,
 };
@@ -122,7 +122,7 @@ const MAX_RETAINED: usize = 0;
 const MAX_RETAINED: usize = 8;
 
 #[cfg(feature = "tls")]
-const INBOUND_N: usize = 0;
+const INBOUND_N: usize = 1;
 #[cfg(not(feature = "tls"))]
 const INBOUND_N: usize = 4;
 
@@ -135,12 +135,12 @@ const STACK_SOCKETS: usize = MAX_SESSIONS + 2;
 
 type Registry = SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>;
 type Retained = RetainedStore<MAX_RETAINED>;
-type Inbound = InboundQueue<INBOUND_N>;
+type Inbound = Channel<CriticalSectionRawMutex, MqttIntent, INBOUND_N>;
 
 static REGISTRY_MUTEX: Mutex<CriticalSectionRawMutex, Registry> =
     Mutex::new(SessionRegistry::new());
 static RETAINED_MUTEX: Mutex<CriticalSectionRawMutex, Retained> = Mutex::new(RetainedStore::new());
-static INBOUND_MUTEX: Mutex<CriticalSectionRawMutex, Inbound> = Mutex::new(InboundQueue::new());
+static INBOUND_MUTEX: Inbound = Channel::new();
 
 #[cfg(feature = "tls")]
 struct WorkerBuffers {
@@ -295,13 +295,9 @@ impl Drop for OwnedSocketBuffers {
 // ── inbound logger (optional) ─────────────────────────────────────────────────
 
 #[embassy_executor::task]
-async fn inbound_logger_task(inbound: &'static Mutex<CriticalSectionRawMutex, Inbound>) {
+async fn inbound_logger_task(inbound: &'static Inbound) {
     loop {
-        let maybe_intent = {
-            let mut queue = inbound.lock().await;
-            queue.try_recv()
-        };
-        if let Some(intent) = maybe_intent {
+        if let Ok(intent) = inbound.try_receive() {
             let payload = str::from_utf8(intent.payload.as_slice()).unwrap_or("<binary>");
             println!("[INBOUND] {} => {}", intent.topic.as_str(), payload);
         } else {
@@ -945,7 +941,7 @@ fn plain_retained() -> &'static Mutex<CriticalSectionRawMutex, Retained> {
     &RETAINED_MUTEX
 }
 
-fn plain_inbound() -> &'static Mutex<CriticalSectionRawMutex, Inbound> {
+fn plain_inbound() -> &'static Inbound {
     &INBOUND_MUTEX
 }
 
