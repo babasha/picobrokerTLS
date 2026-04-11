@@ -1,0 +1,15 @@
+[build]
+target = "riscv32imc-unknown-none-elf"
+
+[target.riscv32imc-unknown-none-elf]
+runner = "espflash flash --monitor"
+rustflags = [
+    "-C", "link-arg=-Tlinkall.x",
+    "-C", "force-frame-pointers=yes",
+]
+
+[env]
+ESP_LOG_LEVEL = "debug"
+ESP_WIFI_CONFIG_PHY_ENABLE_USB = "true"
+GATOMQTT_WIFI_SSID = "Marcio"
+GATOMQTT_WIFI_PASSWORD = "123456789"

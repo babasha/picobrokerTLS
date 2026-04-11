@@ -1,0 +1,15 @@
+use mbedtls_rs::{PreSharedKey, ServerSessionConfig, SessionConfig, TlsVersion};
+
+const MQTT_PSK_IDENTITY: &[u8] = b"gatomqtt-psk";
+const MQTT_PSK_KEY: &[u8] = &[
+    0x9A, 0x3F, 0xC1, 0x52, 0xD8, 0x6B, 0x17, 0xA4, 0xE3, 0x29, 0x7C, 0x10, 0xB5, 0x4D, 0x8E, 0x62,
+    0x13, 0xF7, 0xA9, 0x3C, 0x58, 0xDE, 0x71, 0x24, 0x8B, 0xC6, 0x4A, 0x91, 0x05, 0xEF, 0x36, 0x7D,
+];
+
+pub fn mqtt_server_config() -> SessionConfig<'static> {
+    let mut config =
+        ServerSessionConfig::new_psk(PreSharedKey::new(MQTT_PSK_IDENTITY, MQTT_PSK_KEY));
+    config.min_version = TlsVersion::Tls1_3;
+
+    SessionConfig::Server(config)
+}

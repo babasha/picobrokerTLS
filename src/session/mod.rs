@@ -1,3 +1,7 @@
+pub mod rate_limit;
+pub mod registry;
+pub mod state;
+
 use crate::client::ClientId;
 use crate::error::BrokerError;
 use crate::protocol::heapless::HeaplessVec;

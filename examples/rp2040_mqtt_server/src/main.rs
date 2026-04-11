@@ -12,7 +12,17 @@ use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
+use gato_embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex as GatoCriticalSectionRawMutex;
+use gato_embassy_sync::mutex::Mutex as GatoMutex;
+use heapless::{String as HString, Vec as HVec};
 use picobroker::broker::PicoBroker;
+use picobroker::config::GATOMQTT_CONFIG;
+use picobroker::handler::connection::connection_loop as gatomqtt_connection_loop;
+use picobroker::handler::publish::encode_publish_qos0;
+use picobroker::handler::publish::InboundQueue as GatoInboundQueue;
+use picobroker::router::{find_subscribers, RetainedStore as GatoRetainedStore};
+use picobroker::session::registry::SessionRegistry as GatoSessionRegistry;
+use picobroker::session::state::OutboundPacket;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -21,11 +31,13 @@ mod handler;
 mod io;
 mod server;
 mod state;
+mod transport;
 
 // Public exports
 pub use handler::{handle_connection, HandlerConfig};
 pub use server::{MqttServer, MqttServerConfig};
 pub use state::{current_time_nanos, NotificationRegistry, SessionIdGen};
+pub use transport::{TcpTransport, TcpTransportError};
 
 // =============================================================================
 // Convenience Type Aliases
@@ -70,6 +82,16 @@ const MAX_TOPICS: usize = 8;
 const MAX_SUBSCRIBERS_PER_TOPIC: usize = 4;
 const MQTT_PORT: u16 = 1883;
 
+const GATO_MAX_SESSIONS: usize = 8;
+const GATO_MAX_SUBS: usize = 32;
+const GATO_MAX_INFLIGHT: usize = 16;
+const GATO_MAX_RETAINED: usize = 64;
+const GATO_INBOUND_N: usize = 8;
+const GATO_OUTBOUND_N: usize = 8;
+const GATO_MAX_PACKET_SIZE: usize = 512;
+const GATO_TCP_BUFFER_SIZE: usize = 4096;
+const GATO_MQTT_PORT: u16 = 1883;
+
 // Type aliases for broker
 type MqttBroker = PicoBroker<
     MAX_TOPIC_NAME_LENGTH,
@@ -88,6 +110,28 @@ static NOTIFICATION_REGISTRY: StaticCell<
 > = StaticCell::new();
 static SESSION_ID_GEN_CELL: StaticCell<Mutex<CriticalSectionRawMutex, SessionIdGen>> =
     StaticCell::new();
+static GATO_REGISTRY_CELL: StaticCell<
+    GatoMutex<
+        GatoCriticalSectionRawMutex,
+        GatoSessionRegistry<GATO_MAX_SESSIONS, GATO_MAX_SUBS, GATO_MAX_INFLIGHT>,
+    >,
+> = StaticCell::new();
+static GATO_RETAINED_CELL: StaticCell<
+    GatoMutex<GatoCriticalSectionRawMutex, GatoRetainedStore<GATO_MAX_RETAINED>>,
+> = StaticCell::new();
+static GATO_INBOUND_Q_CELL: StaticCell<
+    GatoMutex<GatoCriticalSectionRawMutex, GatoInboundQueue<GATO_INBOUND_N>>,
+> = StaticCell::new();
+static GATO_OUTBOUND_Q_CELL: StaticCell<
+    Channel<CriticalSectionRawMutex, OutboundPublish, GATO_OUTBOUND_N>,
+> = StaticCell::new();
+
+#[derive(Debug, Clone)]
+struct OutboundPublish {
+    topic: HString<128>,
+    payload: HVec<u8, 512>,
+    retain: bool,
+}
 
 pub struct WifiPins {
     pub pwr: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_23>,
@@ -253,6 +297,110 @@ async fn cleanup_task(broker: &'static BrokerMutex) {
     }
 }
 
+#[embassy_executor::task]
+async fn gatomqtt_inbound_logger_task(
+    inbound_queue: &'static GatoMutex<GatoCriticalSectionRawMutex, GatoInboundQueue<GATO_INBOUND_N>>,
+    outbound_queue: &'static Channel<CriticalSectionRawMutex, OutboundPublish, GATO_OUTBOUND_N>,
+) {
+    loop {
+        let maybe_intent = {
+            let mut inbound_queue = inbound_queue.lock().await;
+            inbound_queue.try_recv()
+        };
+
+        if let Some(intent) = maybe_intent {
+            defmt::info!(
+                "GatoMQTT inbound topic={} payload_len={=usize}",
+                intent.topic.as_str(),
+                intent.payload.len()
+            );
+
+            if let Some(state_topic) = map_set_topic_to_state(intent.topic.as_str()) {
+                let mut payload = HVec::<u8, 512>::new();
+                let _ = payload.extend_from_slice(intent.payload.as_slice());
+                let outbound = OutboundPublish {
+                    topic: state_topic,
+                    payload,
+                    retain: true,
+                };
+
+                if outbound_queue.try_send(outbound).is_err() {
+                    defmt::warn!("GatoMQTT outbound queue full; dropping state echo");
+                }
+            }
+        } else {
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn mqtt_publish_task(
+    registry: &'static GatoMutex<
+        GatoCriticalSectionRawMutex,
+        GatoSessionRegistry<GATO_MAX_SESSIONS, GATO_MAX_SUBS, GATO_MAX_INFLIGHT>,
+    >,
+    retained: &'static GatoMutex<GatoCriticalSectionRawMutex, GatoRetainedStore<GATO_MAX_RETAINED>>,
+    outbound_queue: &'static Channel<CriticalSectionRawMutex, OutboundPublish, GATO_OUTBOUND_N>,
+) {
+    loop {
+        let outbound = outbound_queue.receive().await;
+        let bytes = match encode_publish_qos0(
+            outbound.topic.as_str(),
+            outbound.payload.as_slice(),
+            outbound.retain,
+        ) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                defmt::warn!("GatoMQTT failed to encode outbound publish");
+                continue;
+            }
+        };
+
+        let mut registry = registry.lock().await;
+        let subscribers = find_subscribers(&registry, outbound.topic.as_str(), usize::MAX);
+
+        if outbound.retain {
+            let mut retained = retained.lock().await;
+            if retained
+                .set(
+                    outbound.topic.as_str(),
+                    outbound.payload.as_slice(),
+                    mqttrs::QoS::AtMostOnce,
+                )
+                .is_err()
+            {
+                defmt::warn!("GatoMQTT retained store full; dropping retained update");
+            }
+            drop(retained);
+        }
+
+        for (session_id, _) in subscribers {
+            let Some(session) = registry.get_mut(session_id) else {
+                continue;
+            };
+
+            if session
+                .outbox
+                .push(OutboundPacket {
+                    bytes: bytes.clone(),
+                })
+                .is_err()
+            {
+                defmt::warn!("GatoMQTT session outbox full for session {}", session_id);
+            }
+        }
+    }
+}
+
+fn map_set_topic_to_state(topic: &str) -> Option<HString<128>> {
+    let prefix = topic.strip_suffix("/set")?;
+    let mut state_topic = HString::<128>::new();
+    state_topic.push_str(prefix).ok()?;
+    state_topic.push_str("/state").ok()?;
+    Some(state_topic)
+}
+
 // =============================================================================
 // Accept Task
 // =============================================================================
@@ -339,6 +487,56 @@ async fn accept_task(
     }
 }
 
+#[embassy_executor::task(pool_size = GATO_MAX_SESSIONS)]
+async fn gatomqtt_accept_task(
+    stack: &'static Stack<'static>,
+    socket_idx: usize,
+    registry: &'static GatoMutex<
+        GatoCriticalSectionRawMutex,
+        GatoSessionRegistry<GATO_MAX_SESSIONS, GATO_MAX_SUBS, GATO_MAX_INFLIGHT>,
+    >,
+    retained: &'static GatoMutex<GatoCriticalSectionRawMutex, GatoRetainedStore<GATO_MAX_RETAINED>>,
+    inbound_queue: &'static GatoMutex<
+        GatoCriticalSectionRawMutex,
+        GatoInboundQueue<GATO_INBOUND_N>,
+    >,
+) {
+    loop {
+        let mut rx_buf = [0u8; GATO_TCP_BUFFER_SIZE];
+        let mut tx_buf = [0u8; GATO_TCP_BUFFER_SIZE];
+        let mut socket = embassy_net::tcp::TcpSocket::new(*stack, &mut rx_buf, &mut tx_buf);
+        socket.set_timeout(Some(embassy_time::Duration::from_secs(30)));
+
+        defmt::debug!(
+            "GatoMQTT socket {} waiting on port {}",
+            socket_idx,
+            GATO_MQTT_PORT
+        );
+
+        if socket.accept(GATO_MQTT_PORT).await.is_err() {
+            defmt::warn!("GatoMQTT socket {} accept error", socket_idx);
+            embassy_time::Timer::after(embassy_time::Duration::from_secs(1)).await;
+            continue;
+        }
+
+        defmt::info!("GatoMQTT socket {} accepted client", socket_idx);
+
+        let mut transport = TcpTransport::new(socket);
+        let mut frame_buf = [0u8; GATO_MAX_PACKET_SIZE];
+        gatomqtt_connection_loop(
+            &mut transport,
+            registry,
+            retained,
+            inbound_queue,
+            &GATOMQTT_CONFIG,
+            &mut frame_buf,
+        )
+        .await;
+
+        defmt::info!("GatoMQTT socket {} ready for new connection", socket_idx);
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -381,35 +579,46 @@ async fn main(spawner: Spawner) {
     info!("SSID: {}", WIFI_SSID);
     info!("IP Address: {}", ip_info.address);
 
-    // Initialize MQTT broker components using library types
-    let broker: &'static BrokerMutex = BROKER_CELL.init(Mutex::new(MqttBroker::new()));
-    let session_id_gen: &'static Mutex<CriticalSectionRawMutex, SessionIdGen> =
+    // Legacy broker components stay available in the example, but the active path below
+    // runs the new GatoMQTT connection loop on top of embassy-net TcpSocket.
+    let _broker: &'static BrokerMutex = BROKER_CELL.init(Mutex::new(MqttBroker::new()));
+    let _session_id_gen: &'static Mutex<CriticalSectionRawMutex, SessionIdGen> =
         SESSION_ID_GEN_CELL.init(Mutex::new(SessionIdGen::new()));
-
-    // Build notification registry
-    let channels = core::array::from_fn(|_| Channel::<CriticalSectionRawMutex, (), 1>::new());
-    let notification_registry: &'static NotificationRegistry<
+    let _notification_registry: &'static NotificationRegistry<
         MAX_SESSIONS,
         CriticalSectionRawMutex,
-    > = NOTIFICATION_REGISTRY.init(NotificationRegistry::new(channels));
+    > = NOTIFICATION_REGISTRY.init(NotificationRegistry::new(core::array::from_fn(|_| {
+        Channel::<CriticalSectionRawMutex, (), 1>::new()
+    })));
 
-    info!("MQTT broker initialized");
+    let registry = GATO_REGISTRY_CELL.init(GatoMutex::new(GatoSessionRegistry::new()));
+    let retained = GATO_RETAINED_CELL.init(GatoMutex::new(GatoRetainedStore::new()));
+    let inbound_queue = GATO_INBOUND_Q_CELL.init(GatoMutex::new(GatoInboundQueue::new()));
+    let outbound_queue = GATO_OUTBOUND_Q_CELL.init(Channel::new());
 
-    // Spawn cleanup and accept tasks
-    let _ = spawner.spawn(cleanup_task(broker));
-    info!("Cleanup task spawned");
+    info!("GatoMQTT broker initialized");
+    info!("GatoMQTT listening on port {}", GATO_MQTT_PORT);
+    info!(
+        "GatoMQTT supports up to {} concurrent sessions",
+        GATO_MAX_SESSIONS
+    );
+    info!("TLS is not enabled on this step yet; use plaintext MQTT for stand testing");
 
-    for idx in 0..MAX_SESSIONS {
-        let _ = spawner.spawn(accept_task(
+    let _ = spawner.spawn(gatomqtt_inbound_logger_task(inbound_queue, outbound_queue));
+    let _ = spawner.spawn(mqtt_publish_task(
+        registry,
+        retained,
+        outbound_queue,
+    ));
+    for idx in 0..GATO_MAX_SESSIONS {
+        let _ = spawner.spawn(gatomqtt_accept_task(
             stack,
-            broker,
-            notification_registry,
-            session_id_gen,
             idx,
+            registry,
+            retained,
+            inbound_queue,
         ));
     }
-    info!("MQTT server listening on port 1883");
-    info!("Supporting up to {} concurrent sessions", MAX_SESSIONS);
 
     // Keep executor alive
     loop {

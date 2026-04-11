@@ -1,10 +1,29 @@
 [package]
-name = "picobroker"
-version = "0.1.1"
+name = "GatoMQTT"
+version = "0.1.0"
 edition = "2021"
-description = "Pure no_std core library for PicoBroker MQTT 3.1.1 broker"
+description = "GatoMQTT local no_std MQTT 3.1.1 broker"
 license = "MIT"
 repository = "https://github.com/darkcodi/picobroker"
-keywords = ["mqtt", "broker", "embedded", "no_std", "mqtt_3_1_1"]
+keywords = ["mqtt", "broker", "embedded", "no_std", "gatomqtt"]
 categories = ["network-programming", "embedded", "parser-implementations"]
 readme = "./README.md"
+
+[workspace]
+members = ["."]
+resolver = "2"
+
+[dependencies]
+mqttrs = { version = "0.4", default-features = false }
+heapless = "0.8"
+heapless07 = { package = "heapless", version = "0.7.17" }
+embassy-sync = { version = "0.7", features = ["defmt"] }
+embassy-futures = "0.1"
+embassy-time = { version = "0.5" }
+defmt = "1.0.1"
+sha2 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+embassy-time = { version = "0.5", features = ["std", "generic-queue-8"] }
+futures = "0.3"
+critical-section = { version = "1.2", features = ["std"] }

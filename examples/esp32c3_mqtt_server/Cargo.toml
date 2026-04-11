@@ -1,0 +1,49 @@
+[package]
+name = "esp32c3_mqtt_server"
+version = "0.1.0"
+edition = "2021"
+
+[patch.crates-io]
+esp-rtos = { git = "https://github.com/esp-rs/esp-hal", rev = "8a9fd5e" }
+esp-hal = { git = "https://github.com/esp-rs/esp-hal", rev = "8a9fd5e" }
+esp-alloc = { git = "https://github.com/esp-rs/esp-hal", rev = "8a9fd5e" }
+esp-backtrace = { git = "https://github.com/esp-rs/esp-hal", rev = "8a9fd5e" }
+esp-println = { git = "https://github.com/esp-rs/esp-hal", rev = "8a9fd5e" }
+esp-radio = { git = "https://github.com/esp-rs/esp-hal", rev = "8a9fd5e" }
+esp-bootloader-esp-idf = { git = "https://github.com/esp-rs/esp-hal", rev = "8a9fd5e" }
+
+[dependencies]
+gatomqtt = { package = "GatoMQTT", path = "../../" }
+embassy-sync = { version = "0.7", features = ["defmt"] }
+embassy-time = "0.5"
+embassy-executor = "0.9"
+embassy-futures = "0.1"
+embassy-net = { version = "0.8", features = ["proto-ipv4", "tcp", "dhcpv4", "medium-ethernet"] }
+defmt = "1.0.1"
+embedded-io = "0.7"
+mqttrs = { version = "0.4", default-features = false }
+log = { version = "0.4", default-features = false }
+mbedtls-rs = { path = "../../../mbedtls-rs/mbedtls-rs", default-features = false, features = ["log", "force-esp-riscv-gcc"], optional = true }
+esp-hal = { version = "1.0.0", features = ["esp32c3", "unstable", "exception-handler", "log-04"] }
+esp-backtrace = { version = "0.18.1", features = ["esp32c3", "panic-handler", "println"] }
+esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32c3"] }
+esp-metadata-generated = { version = "0.3", features = ["esp32c3"] }
+esp-println = { version = "0.16.1", default-features = false, features = ["esp32c3", "uart", "defmt-espflash", "log-04"] }
+esp-alloc = "0.9.0"
+esp-radio = { version = "0.17.0", features = ["esp32c3", "wifi", "log-04", "unstable"] }
+esp-rtos = { version = "0.2.0", features = ["esp32c3", "embassy", "esp-radio"] }
+static_cell = "2.1"
+tinyrlibc = { version = "0.5", default-features = false, features = ["memchr"] }
+
+[features]
+default = []
+tls = ["dep:mbedtls-rs", "mbedtls-rs/esp32c3", "mbedtls-rs/embassy-time"]
+
+[profile.release]
+opt-level = "z"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[workspace]
