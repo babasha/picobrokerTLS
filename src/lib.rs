@@ -1,21 +1,15 @@
 #![no_std]
-#![allow(non_snake_case)]
 
 #[cfg(test)]
 extern crate std;
 
 pub mod codec;
-pub mod handler;
 pub mod config;
-pub mod broker;
-pub mod client;
-pub mod error;
-pub mod protocol;
+pub mod handler;
 pub mod router;
 #[path = "session/mod.rs"]
 pub mod session;
 pub mod tls;
-pub mod topics;
 pub mod transport;
 
 #[cfg(test)]
