@@ -5,7 +5,7 @@ use heapless::{String, Vec};
 use mqttrs::QoS;
 
 pub const MAX_OUTBOUND_FRAME_SIZE: usize = 192;
-pub const MAX_OUTBOX_DEPTH: usize = 2;
+pub const MAX_OUTBOX_DEPTH: usize = 8;
 
 pub type SessionId = usize;
 pub type ClientId = String<64>;
@@ -20,6 +20,12 @@ pub struct SessionState<const MAX_SUBS: usize, const MAX_INFLIGHT: usize> {
     pub keepalive_secs: u16,
     pub last_activity: Instant,
     pub lwt: Option<LwtMessage>,
+    /// Consecutive outbox-full drops since last successful drain.
+    /// Reset to 0 when the outbox is found empty (subscriber caught up).
+    pub outbox_drops: u8,
+    /// Set when `outbox_drops` reaches the configured threshold.
+    /// The session's own connection loop checks this flag and disconnects cleanly.
+    pub quarantined: bool,
     next_packet_id: u16,
 }
 
@@ -63,6 +69,8 @@ impl<const MAX_SUBS: usize, const MAX_INFLIGHT: usize> SessionState<MAX_SUBS, MA
             keepalive_secs,
             last_activity: Instant::from_ticks(0),
             lwt: None,
+            outbox_drops: 0,
+            quarantined: false,
             next_packet_id: 0,
         }
     }
@@ -207,6 +215,8 @@ mod tests {
         assert_eq!(state.keepalive_secs, 60);
         assert_eq!(state.last_activity, Instant::from_ticks(0));
         assert!(state.lwt.is_none());
+        assert_eq!(state.outbox_drops, 0);
+        assert!(!state.quarantined);
     }
 
     #[test]

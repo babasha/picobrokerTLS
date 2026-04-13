@@ -11,6 +11,9 @@ pub struct BrokerConfig {
     pub rate_capacity: u8,
     pub rate_per_sec: u8,
     pub max_violations: u8,
+    /// How many consecutive outbox-full drops quarantine a slow subscriber.
+    /// Once reached the subscriber's connection loop will disconnect it cleanly.
+    pub max_outbox_drops: u8,
     pub qos1_retry_ms: u32,
     pub qos1_max_retries: u8,
 }
@@ -27,6 +30,7 @@ pub const GATOMQTT_CONFIG: BrokerConfig = BrokerConfig {
     rate_capacity: 20,
     rate_per_sec: 10,
     max_violations: 50,
+    max_outbox_drops: 16,
     qos1_retry_ms: 5_000,
     qos1_max_retries: 3,
 };

@@ -15,6 +15,36 @@ pub enum DisconnectError {
     Broadcast(LwtBroadcastError),
 }
 
+/// Why a client session ended. Drives LWT publication and observability logging.
+///
+/// MQTT 3.1.1 rule: LWT fires for every reason *except* `ClientDisconnect`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectReason {
+    /// Client sent a clean DISCONNECT packet — no LWT.
+    ClientDisconnect,
+    /// TCP connection closed (EOF) without a DISCONNECT packet.
+    ConnectionClosed,
+    /// Transport read or write error.
+    TransportError,
+    /// Keepalive timer expired with no activity from the client.
+    KeepaliveTimeout,
+    /// Client exceeded the publish rate limit.
+    RateLimitExceeded,
+    /// QoS1 command intent reached the handler while it was overloaded.
+    CommandHandlerOverloaded,
+    /// QoS1 inflight retry limit exhausted — remote is unresponsive.
+    RetryLimitExceeded,
+    /// Subscriber outbox backpressure crossed the quarantine threshold.
+    OutboxQuarantine,
+}
+
+impl DisconnectReason {
+    /// Returns `true` when the LWT must *not* be published (clean disconnect).
+    pub fn is_clean(self) -> bool {
+        matches!(self, DisconnectReason::ClientDisconnect)
+    }
+}
+
 pub trait LwtBroadcaster {
     fn broadcast(
         &self,
@@ -33,9 +63,9 @@ pub async fn publish_lwt_if_needed<
     registry: &SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>,
     retained: &mut RetainedStore<MAX_RETAINED>,
     broadcaster: &dyn LwtBroadcaster,
-    clean_disconnect: bool,
+    reason: DisconnectReason,
 ) -> Result<(), DisconnectError> {
-    if clean_disconnect {
+    if reason.is_clean() {
         return Ok(());
     }
 
@@ -111,7 +141,7 @@ const fn qos_rank(qos: QoS) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{publish_lwt_if_needed, DisconnectError, LwtBroadcaster, LwtBroadcastError};
+    use super::{publish_lwt_if_needed, DisconnectError, DisconnectReason, LwtBroadcaster, LwtBroadcastError};
     use crate::router::RetainedStore;
     use crate::session::registry::SessionRegistry;
     use crate::session::state::{LwtMessage, SessionId, SessionState, Subscription};
@@ -225,7 +255,7 @@ mod tests {
             &registry,
             &mut retained,
             &broadcaster,
-            true,
+            DisconnectReason::ClientDisconnect,
         ))
         .unwrap();
 
@@ -261,7 +291,7 @@ mod tests {
             &registry,
             &mut retained,
             &broadcaster,
-            false,
+            DisconnectReason::KeepaliveTimeout,
         ))
         .unwrap();
 
@@ -293,7 +323,7 @@ mod tests {
             &registry,
             &mut retained,
             &broadcaster,
-            false,
+            DisconnectReason::ConnectionClosed,
         ))
         .unwrap();
 
@@ -314,7 +344,7 @@ mod tests {
             &registry,
             &mut retained,
             &broadcaster,
-            false,
+            DisconnectReason::ConnectionClosed,
         ))
         .unwrap();
 
@@ -355,7 +385,7 @@ mod tests {
             &registry,
             &mut retained,
             &FailingBroadcaster,
-            false,
+            DisconnectReason::ConnectionClosed,
         ))
         .unwrap_err();
 

@@ -1,10 +1,13 @@
 use crate::codec::frame::{read_packet, ReadError};
 use crate::config::BrokerConfig;
 use crate::handler::connect::{prepare_connect, write_connack, HouseToken, PreparedConnect};
-use crate::handler::disconnect::{publish_lwt_if_needed, LwtBroadcaster, LwtBroadcastError};
+use crate::handler::disconnect::{
+    publish_lwt_if_needed, DisconnectReason, LwtBroadcaster, LwtBroadcastError,
+};
 use crate::handler::pingreq::touch_pingreq;
+use crate::handler::command::CommandHandler;
 use crate::handler::publish::{
-    handle_puback, handle_publish, process_inflight_retries, MqttIntent, PublishError,
+    handle_puback, handle_publish, process_inflight_retries, PublishError,
 };
 use crate::handler::subscribe::{
     apply_unsubscribe, prepare_subscribe, write_prepared_subscribe,
@@ -17,7 +20,6 @@ use crate::transport::Transport;
 use core::cell::RefCell;
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::RawMutex;
-use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use heapless::Vec;
@@ -65,21 +67,20 @@ impl<const MAX_DELIVERIES: usize> LwtBroadcaster for RecordingLwtBroadcaster<MAX
 pub async fn connection_loop<
     T: Transport,
     M: RawMutex,
+    H: CommandHandler,
     const MAX_SESSIONS: usize,
     const MAX_SUBS: usize,
     const MAX_INFLIGHT: usize,
     const MAX_RETAINED: usize,
-    const INBOUND_N: usize,
     const MAX_PACKET_SIZE: usize,
 >(
     transport: &mut T,
     registry: &Mutex<M, SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>>,
     retained: &Mutex<M, RetainedStore<MAX_RETAINED>>,
-    inbound_queue: &Channel<M, MqttIntent, INBOUND_N>,
+    command_handler: &H,
     config: &BrokerConfig,
     frame_buf: &mut [u8; MAX_PACKET_SIZE],
 ) {
-    let mut clean_disconnect = false;
     let mut write_buf = [0u8; MAX_PACKET_SIZE];
 
     defmt::info!("mqtt connection_loop: waiting for CONNECT");
@@ -121,10 +122,13 @@ pub async fn connection_loop<
                 let session_id = outcome.session_id;
                 if let Some(session) = registry.get_mut(session_id) {
                     session.rate = TokenBucket::new(config.rate_capacity, config.rate_per_sec);
+                    // Reset keepalive timer from the moment of this (re)connection,
+                    // regardless of whether the session was fresh or resumed.
+                    session.update_activity();
                 }
                 drop(registry);
 
-                if write_connack(transport, mqttrs::ConnectReturnCode::Accepted, &mut write_buf)
+                if write_connack(transport, mqttrs::ConnectReturnCode::Accepted, outcome.session_present, &mut write_buf)
                     .await
                     .is_err()
                 {
@@ -138,7 +142,7 @@ pub async fn connection_loop<
             }
             Ok(PreparedConnect::Rejected(code)) => {
                 drop(registry);
-                let _ = write_connack(transport, code, &mut write_buf).await;
+                let _ = write_connack(transport, code, false, &mut write_buf).await;
                 transport.close().await;
                 defmt::warn!("mqtt connection_loop: CONNECT rejected");
                 return;
@@ -150,16 +154,24 @@ pub async fn connection_loop<
         }
     };
 
-    loop {
-        if flush_outbox_for_session(session_id, registry, transport).await.is_err() {
-            break;
+    let reason: DisconnectReason = loop {
+        if flush_outbox_for_session(session_id, registry, transport)
+            .await
+            .is_err()
+        {
+            break DisconnectReason::TransportError;
         }
 
         {
             let mut registry = registry.lock().await;
             let Some(session) = registry.get_mut(session_id) else {
-                break;
+                break DisconnectReason::ConnectionClosed;
             };
+
+            if session.quarantined {
+                defmt::warn!("mqtt connection_loop: session quarantined; disconnecting slow subscriber");
+                break DisconnectReason::OutboxQuarantine;
+            }
 
             if process_inflight_retries(
                 session,
@@ -171,18 +183,18 @@ pub async fn connection_loop<
             .await
             .is_err()
             {
-                break;
+                break DisconnectReason::RetryLimitExceeded;
             }
 
             if session.is_keepalive_expired(embassy_time::Instant::now()) {
-                break;
+                break DisconnectReason::KeepaliveTimeout;
             }
         }
 
         let timer_after = {
             let registry = registry.lock().await;
             let Some(session) = registry.get(session_id) else {
-                break;
+                break DisconnectReason::ConnectionClosed;
             };
             session.next_wakeup_after(
                 embassy_time::Instant::now(),
@@ -199,25 +211,29 @@ pub async fn connection_loop<
         {
             Either::First(Ok(packet)) => {
                 if touch_session_activity(session_id, registry).await.is_err() {
-                    break;
+                    break DisconnectReason::ConnectionClosed;
                 }
 
                 match packet {
                     Packet::Publish(publish) => {
                         let mut registry = registry.lock().await;
                         let mut retained = retained.lock().await;
-                        if matches!(
-                            handle_publish(
-                                session_id,
+                        match handle_publish(
+                            session_id,
                             &mut registry,
                             &mut retained,
-                            inbound_queue,
+                            command_handler,
                             &publish,
-                            )
-                            .await,
-                            Err(PublishError::RateLimitDisconnect)
-                        ) {
-                            break;
+                        )
+                        .await
+                        {
+                            Err(PublishError::RateLimitDisconnect) => {
+                                break DisconnectReason::RateLimitExceeded;
+                            }
+                            Err(PublishError::CommandHandlerOverloaded) => {
+                                break DisconnectReason::CommandHandlerOverloaded;
+                            }
+                            _ => {}
                         }
                     }
                     Packet::Puback(pid) => {
@@ -225,7 +241,7 @@ pub async fn connection_loop<
                         if let Some(session) = registry.get_mut(session_id) {
                             handle_puback(session, pid.get());
                         } else {
-                            break;
+                            break DisconnectReason::ConnectionClosed;
                         }
                     }
                     Packet::Subscribe(subscribe) => {
@@ -233,7 +249,7 @@ pub async fn connection_loop<
                             let mut registry = registry.lock().await;
                             let retained = retained.lock().await;
                             let Some(session) = registry.get_mut(session_id) else {
-                                break;
+                                break DisconnectReason::ConnectionClosed;
                             };
                             prepare_subscribe(session, &subscribe, &retained)
                         };
@@ -241,14 +257,14 @@ pub async fn connection_loop<
                             .await
                             .is_err()
                         {
-                            break;
+                            break DisconnectReason::TransportError;
                         }
                     }
                     Packet::Unsubscribe(unsubscribe) => {
                         {
                             let mut registry = registry.lock().await;
                             let Some(session) = registry.get_mut(session_id) else {
-                                break;
+                                break DisconnectReason::ConnectionClosed;
                             };
                             apply_unsubscribe(session, &unsubscribe);
                         }
@@ -260,14 +276,14 @@ pub async fn connection_loop<
                         .await
                         .is_err()
                         {
-                            break;
+                            break DisconnectReason::TransportError;
                         }
                     }
                     Packet::Pingreq => {
                         {
                             let mut registry = registry.lock().await;
                             let Some(session) = registry.get_mut(session_id) else {
-                                break;
+                                break DisconnectReason::ConnectionClosed;
                             };
                             touch_pingreq(session);
                         }
@@ -279,33 +295,32 @@ pub async fn connection_loop<
                         .await
                         .is_err()
                         {
-                            break;
+                            break DisconnectReason::TransportError;
                         }
                     }
                     Packet::Disconnect => {
                         defmt::info!("mqtt connection_loop: DISCONNECT received");
-                        clean_disconnect = true;
-                        break;
+                        break DisconnectReason::ClientDisconnect;
                     }
                     _ => {}
                 }
             }
             Either::First(Err(ReadError::Eof)) => {
                 defmt::warn!("mqtt connection_loop: EOF");
-                break;
+                break DisconnectReason::ConnectionClosed;
             }
             Either::First(Err(_)) => {
                 defmt::warn!("mqtt connection_loop: read error");
-                break;
+                break DisconnectReason::TransportError;
             }
             Either::Second(_) => continue,
         }
-    }
+    };
 
     defmt::info!("mqtt connection_loop: cleanup");
     cleanup_connection(
         session_id,
-        clean_disconnect,
+        reason,
         transport,
         registry,
         retained,
@@ -349,6 +364,9 @@ async fn flush_outbox_for_session<
             };
 
             if session.outbox.is_empty() {
+                // Subscriber has caught up — reset backpressure counter so a future
+                // temporary burst does not count against the old accumulated drops.
+                session.outbox_drops = 0;
                 None
             } else {
                 Some(session.outbox.remove(0))
@@ -372,7 +390,7 @@ async fn cleanup_connection<
     const MAX_RETAINED: usize,
 >(
     session_id: SessionId,
-    clean_disconnect: bool,
+    reason: DisconnectReason,
     transport: &mut T,
     registry: &Mutex<M, SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>>,
     retained: &Mutex<M, RetainedStore<MAX_RETAINED>>,
@@ -392,7 +410,7 @@ async fn cleanup_connection<
                 &registry_guard,
                 &mut retained_guard,
                 &broadcaster,
-                clean_disconnect,
+                reason,
             )
             .await;
         }
@@ -446,7 +464,7 @@ fn encode_publish_from_lwt(
 mod tests {
     use super::connection_loop;
     use crate::config::BrokerConfig;
-    use crate::handler::publish::MqttIntent;
+    use crate::handler::command::MqttIntent;
     use crate::router::RetainedStore;
     use crate::session::registry::SessionRegistry;
     use crate::session::state::{InflightEntry, SessionState, Subscription};
@@ -581,6 +599,7 @@ mod tests {
             rate_capacity: 20,
             rate_per_sec: 10,
             max_violations: 50,
+            max_outbox_drops: 16,
             qos1_retry_ms: 5_000,
             qos1_max_retries: 3,
         }

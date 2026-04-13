@@ -16,6 +16,8 @@ pub fn topic_matches(filter: &str, pub_topic: &str) -> bool {
 
     loop {
         match (filter_levels.next(), topic_levels.next()) {
+            // '#' matches this level and everything below, including the parent alone ("a/#" matches "a")
+            (Some("#"), _) => return true,
             (Some("+"), Some(level)) if !level.is_empty() => {}
             (Some(filter_level), Some(topic_level)) if filter_level == topic_level => {}
             (None, None) => return true,
@@ -118,6 +120,32 @@ mod tests {
     fn sys_topics_do_not_match_wildcards() {
         assert!(topic_matches("$SYS/broker", "$SYS/broker"));
         assert!(!topic_matches("+", "$SYS/broker"));
+    }
+
+    #[test]
+    fn hash_wildcard_matches_all_levels_below() {
+        assert!(topic_matches("#", "a"));
+        assert!(topic_matches("#", "a/b/c"));
+        assert!(topic_matches("a/#", "a/b"));
+        assert!(topic_matches("a/#", "a/b/c/d"));
+        assert!(topic_matches("sb/#", "sb/house1/device/relay-1/state"));
+    }
+
+    #[test]
+    fn hash_wildcard_matches_parent_level_alone() {
+        // per MQTT spec: "a/#" also matches "a"
+        assert!(topic_matches("a/#", "a"));
+    }
+
+    #[test]
+    fn hash_wildcard_does_not_match_different_prefix() {
+        assert!(!topic_matches("a/#", "b/c"));
+        assert!(!topic_matches("a/b/#", "a/c/d"));
+    }
+
+    #[test]
+    fn hash_wildcard_does_not_match_dollar_topics() {
+        assert!(!topic_matches("#", "$SYS/broker"));
     }
 
     #[test]

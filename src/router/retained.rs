@@ -64,6 +64,12 @@ impl<const N: usize> RetainedStore<N> {
             .map_err(|_| RetainedError::Full)
     }
 
+    /// Iterates over every retained entry. Intended for firmware-side serialisation
+    /// (e.g. persisting the snapshot to NVS before shutdown).
+    pub fn iter(&self) -> impl Iterator<Item = &RetainedEntry> {
+        self.entries.iter()
+    }
+
     pub fn matching<'a>(&'a self, filter: &'a str) -> impl Iterator<Item = &'a RetainedEntry> + 'a {
         self.entries
             .iter()
@@ -174,6 +180,17 @@ mod tests {
         let matches: Vec<_> = store.matching("a/b").map(|entry| entry.topic.as_str()).collect();
 
         assert_eq!(matches, vec!["a/b"]);
+    }
+
+    #[test]
+    fn iter_returns_all_entries() {
+        let mut store = RetainedStore::<64>::new();
+        store.set("a/b", &[1], QoS::AtMostOnce).unwrap();
+        store.set("c/d", &[2], QoS::AtLeastOnce).unwrap();
+
+        let topics: Vec<_> = store.iter().map(|e| e.topic.as_str()).collect();
+
+        assert_eq!(topics, vec!["a/b", "c/d"]);
     }
 
     #[test]

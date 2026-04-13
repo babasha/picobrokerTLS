@@ -299,7 +299,28 @@ fn upsert_subscription<const MAX_SUBS: usize>(
 }
 
 fn is_valid_filter(filter: &str) -> bool {
-    !filter.is_empty() && filter.len() <= 128 && !filter.contains('#')
+    if filter.is_empty() || filter.len() > 128 {
+        return false;
+    }
+
+    // '#' is only valid as a complete level at the end: "a/#", "#", but not "a/#/b" or "a#"
+    if let Some(hash_pos) = filter.find('#') {
+        if hash_pos != filter.len() - 1 {
+            return false;
+        }
+        if hash_pos > 0 && filter.as_bytes()[hash_pos - 1] != b'/' {
+            return false;
+        }
+    }
+
+    // '+' must be a complete level, not embedded: "a/+/b" ok, "a+b" not ok
+    for level in filter.split('/') {
+        if level.contains('+') && level != "+" {
+            return false;
+        }
+    }
+
+    true
 }
 
 #[cfg(test)]
@@ -592,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_hash_filter_returns_failure_code() {
+    fn invalid_hash_not_at_end_returns_failure_code() {
         let (mut registry, session_id) = registry_with_session();
         let retained = retained_store();
         let packet = subscribe_packet("a/#/b", QoS::AtMostOnce, 5);
@@ -609,6 +630,69 @@ mod tests {
         .unwrap();
 
         assert_eq!(transport.tx_log, vec![vec![0x90, 0x03, 0x00, 0x05, 0x80]]);
+    }
+
+    #[test]
+    fn valid_hash_at_end_is_accepted() {
+        let (mut registry, session_id) = registry_with_session();
+        let retained = retained_store();
+        let mut transport = MockTransport::new();
+        let mut frame_buf = [0u8; MAX_PACKET_SIZE];
+
+        for (filter, pid) in [("sb/#", 10u16), ("#", 11), ("sb/house1/#", 12)] {
+            let packet = subscribe_packet(filter, QoS::AtMostOnce, pid);
+            block_on(handle_subscribe(
+                &mut transport,
+                registry.get_mut(session_id).unwrap(),
+                &packet,
+                &retained,
+                &mut frame_buf,
+            ))
+            .unwrap();
+        }
+
+        let state = registry.get(session_id).unwrap();
+        assert_eq!(state.subscriptions.len(), 3);
+    }
+
+    #[test]
+    fn embedded_hash_not_preceded_by_slash_returns_failure_code() {
+        let (mut registry, session_id) = registry_with_session();
+        let retained = retained_store();
+        let packet = subscribe_packet("ab#", QoS::AtMostOnce, 13);
+        let mut transport = MockTransport::new();
+        let mut frame_buf = [0u8; MAX_PACKET_SIZE];
+
+        block_on(handle_subscribe(
+            &mut transport,
+            registry.get_mut(session_id).unwrap(),
+            &packet,
+            &retained,
+            &mut frame_buf,
+        ))
+        .unwrap();
+
+        assert_eq!(transport.tx_log, vec![vec![0x90, 0x03, 0x00, 0x0D, 0x80]]);
+    }
+
+    #[test]
+    fn embedded_plus_not_a_complete_level_returns_failure_code() {
+        let (mut registry, session_id) = registry_with_session();
+        let retained = retained_store();
+        let packet = subscribe_packet("a+b/c", QoS::AtMostOnce, 14);
+        let mut transport = MockTransport::new();
+        let mut frame_buf = [0u8; MAX_PACKET_SIZE];
+
+        block_on(handle_subscribe(
+            &mut transport,
+            registry.get_mut(session_id).unwrap(),
+            &packet,
+            &retained,
+            &mut frame_buf,
+        ))
+        .unwrap();
+
+        assert_eq!(transport.tx_log, vec![vec![0x90, 0x03, 0x00, 0x0E, 0x80]]);
     }
 
     #[test]

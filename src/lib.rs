@@ -10,6 +10,7 @@ pub mod router;
 #[path = "session/mod.rs"]
 pub mod session;
 pub mod tls;
+pub mod topics;
 pub mod transport;
 
 #[cfg(test)]

@@ -15,6 +15,9 @@ pub struct HouseToken<'a> {
 pub struct ConnectOutcome {
     pub session_id: SessionId,
     pub displaced_lwt: Option<LwtMessage>,
+    /// Reflects the CONNACK session_present flag: true when an existing session was
+    /// resumed (clean_session=false and a matching session was found in the registry).
+    pub session_present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,7 +81,7 @@ pub async fn handle_connect_with_outcome<
 ) -> Result<ConnectOutcome, ConnectError<T::Error>> {
     match prepare_connect(registry, packet, house_token) {
         Ok(PreparedConnect::Accepted(outcome)) => {
-            write_connack(transport, ConnectReturnCode::Accepted, frame_buf).await?;
+            write_connack(transport, ConnectReturnCode::Accepted, outcome.session_present, frame_buf).await?;
             Ok(outcome)
         }
         Ok(PreparedConnect::Rejected(code)) => reject_connect(transport, code, frame_buf).await,
@@ -118,6 +121,34 @@ pub fn prepare_connect<
         ));
     }
 
+    // ── clean_session = false: resume existing session ───────────────────────
+    //
+    // MQTT 3.1.1 §3.1.2.4: if clean_session=0 and an existing session is found,
+    // resume it — subscriptions, inflight, and outbox are preserved.
+    // Only connection-level fields (LWT, keepalive) are updated from the new packet.
+    // session_present=true is reflected in CONNACK so the client knows state was kept.
+    if !packet.clean_session {
+        if let Some(existing_id) = registry.find_by_client_id(packet.client_id) {
+            let session = registry.get_mut(existing_id).unwrap();
+            session.lwt = to_lwt(packet)?;
+            session.keepalive_secs = packet.keep_alive;
+            // Reset connection-level backpressure state — this is a fresh TCP connection.
+            session.quarantined = false;
+            session.outbox_drops = 0;
+            // subscriptions, inflight, outbox: intentionally kept (persistent session)
+            return Ok(PreparedConnect::Accepted(ConnectOutcome {
+                session_id: existing_id,
+                displaced_lwt: None,
+                session_present: true,
+            }));
+        }
+        // No existing session → fall through and create a fresh one.
+        // session_present remains false.
+    }
+
+    // ── clean_session = true (or no existing session) ────────────────────────
+    //
+    // Discard any previous session for this client_id, then create a fresh one.
     let mut displaced_lwt = None;
     if let Some(existing_id) = registry.find_by_client_id(packet.client_id) {
         if let Some(previous) = registry.remove(existing_id) {
@@ -150,18 +181,20 @@ pub fn prepare_connect<
     Ok(PreparedConnect::Accepted(ConnectOutcome {
         session_id,
         displaced_lwt,
+        session_present: false,
     }))
 }
 
 pub async fn write_connack<T: Transport, const MAX_PACKET_SIZE: usize>(
     transport: &mut T,
     code: ConnectReturnCode,
+    session_present: bool,
     frame_buf: &mut [u8; MAX_PACKET_SIZE],
 ) -> Result<(), WriteError<T::Error>> {
     write_packet(
         transport,
         &Packet::Connack(Connack {
-            session_present: false,
+            session_present,
             code,
         }),
         frame_buf,
@@ -174,7 +207,8 @@ async fn reject_connect<T: Transport, const MAX_PACKET_SIZE: usize>(
     code: ConnectReturnCode,
     frame_buf: &mut [u8; MAX_PACKET_SIZE],
 ) -> Result<ConnectOutcome, ConnectError<T::Error>> {
-    write_connack(transport, code, frame_buf).await?;
+    // session_present is always false for rejected connections (MQTT 3.1.1 §3.2.2.2)
+    write_connack(transport, code, false, frame_buf).await?;
     transport.close().await;
     Err(ConnectError::Rejected(code))
 }
@@ -574,6 +608,187 @@ mod tests {
         assert_eq!(err, ConnectError::Rejected(ConnectReturnCode::BadUsernamePassword));
         assert_eq!(transport.tx_log, vec![vec![0x20, 0x02, 0x00, 0x04]]);
         assert!(transport.closed);
+    }
+
+    // ── clean_session semantics ───────────────────────────────────────────────
+
+    #[test]
+    fn clean_session_true_always_creates_fresh_session_and_sends_no_session_present() {
+        let mut registry = registry();
+        // Pre-populate a session for this client.
+        registry
+            .insert(SessionState::new(String::<64>::try_from("mobile-app").unwrap(), 30))
+            .unwrap();
+
+        let mut transport = MockTransport::new();
+        let mut frame_buf = [0u8; MAX_PACKET_SIZE];
+        // valid_connect() has clean_session: true
+        let id = block_on(handle_connect(
+            &mut transport,
+            &mut registry,
+            &valid_connect(),
+            &house_token(),
+            &mut frame_buf,
+        ))
+        .unwrap();
+
+        // session_present bit (byte 3) must be 0x00
+        assert_eq!(transport.tx_log, vec![vec![0x20, 0x02, 0x00, 0x00]]);
+        assert_eq!(registry.len(), 1, "old session replaced by fresh one");
+        // The session was replaced — new session_id should still map to mobile-app.
+        assert_eq!(
+            registry.get(id).unwrap().client_id.as_str(),
+            "mobile-app"
+        );
+    }
+
+    #[test]
+    fn clean_session_false_no_existing_session_creates_fresh_and_returns_no_session_present() {
+        let mut registry = registry();
+        let mut transport = MockTransport::new();
+        let mut frame_buf = [0u8; MAX_PACKET_SIZE];
+        let mut packet = valid_connect();
+        packet.clean_session = false;
+
+        block_on(handle_connect(
+            &mut transport,
+            &mut registry,
+            &packet,
+            &house_token(),
+            &mut frame_buf,
+        ))
+        .unwrap();
+
+        // No prior session existed → session_present = 0x00
+        assert_eq!(transport.tx_log, vec![vec![0x20, 0x02, 0x00, 0x00]]);
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn clean_session_false_resumes_existing_session_and_sends_session_present_true() {
+        let mut registry = registry();
+        // Pre-populate a session for this client.
+        registry
+            .insert(SessionState::new(String::<64>::try_from("mobile-app").unwrap(), 30))
+            .unwrap();
+
+        let mut transport = MockTransport::new();
+        let mut frame_buf = [0u8; MAX_PACKET_SIZE];
+        let mut packet = valid_connect();
+        packet.clean_session = false;
+
+        block_on(handle_connect(
+            &mut transport,
+            &mut registry,
+            &packet,
+            &house_token(),
+            &mut frame_buf,
+        ))
+        .unwrap();
+
+        // Existing session reused → session_present bit (byte 3) = 0x01
+        assert_eq!(transport.tx_log, vec![vec![0x20, 0x02, 0x01, 0x00]]);
+        assert_eq!(registry.len(), 1, "no duplicate session created");
+    }
+
+    #[test]
+    fn clean_session_false_preserves_subscriptions_on_resume() {
+        use crate::session::state::Subscription;
+
+        let mut registry = registry();
+        let mut existing = SessionState::new(
+            String::<64>::try_from("mobile-app").unwrap(), 30,
+        );
+        existing
+            .subscriptions
+            .push(Subscription {
+                filter: String::<128>::try_from("sb/house1/device/+/state").unwrap(),
+                qos: QoS::AtLeastOnce,
+            })
+            .unwrap();
+        let old_id = registry.insert(existing).unwrap();
+
+        let mut transport = MockTransport::new();
+        let mut frame_buf = [0u8; MAX_PACKET_SIZE];
+        let mut packet = valid_connect();
+        packet.clean_session = false;
+
+        let resumed_id = block_on(handle_connect(
+            &mut transport,
+            &mut registry,
+            &packet,
+            &house_token(),
+            &mut frame_buf,
+        ))
+        .unwrap();
+
+        assert_eq!(resumed_id, old_id, "same session slot reused");
+        let subs = &registry.get(resumed_id).unwrap().subscriptions;
+        assert_eq!(subs.len(), 1, "subscription survived reconnect");
+        assert_eq!(subs[0].filter.as_str(), "sb/house1/device/+/state");
+    }
+
+    #[test]
+    fn clean_session_false_updates_lwt_and_keepalive_on_resume() {
+        let mut registry = registry();
+        let old = SessionState::new(String::<64>::try_from("mobile-app").unwrap(), 30);
+        registry.insert(old).unwrap();
+
+        let mut transport = MockTransport::new();
+        let mut frame_buf = [0u8; MAX_PACKET_SIZE];
+        let mut packet = valid_connect();
+        packet.clean_session = false;
+        packet.keep_alive = 120;
+        packet.last_will = Some(LastWill {
+            topic: "sb/house1/device/app/state",
+            message: b"offline",
+            qos: QoS::AtLeastOnce,
+            retain: true,
+        });
+
+        let resumed_id = block_on(handle_connect(
+            &mut transport,
+            &mut registry,
+            &packet,
+            &house_token(),
+            &mut frame_buf,
+        ))
+        .unwrap();
+
+        let session = registry.get(resumed_id).unwrap();
+        assert_eq!(session.keepalive_secs, 120);
+        let lwt = session.lwt.as_ref().unwrap();
+        assert_eq!(lwt.topic.as_str(), "sb/house1/device/app/state");
+        assert_eq!(lwt.payload.as_slice(), b"offline");
+    }
+
+    #[test]
+    fn clean_session_false_resets_quarantine_flag_on_resume() {
+        let mut registry = registry();
+        let mut quarantined = SessionState::new(
+            String::<64>::try_from("mobile-app").unwrap(), 30,
+        );
+        quarantined.quarantined = true;
+        quarantined.outbox_drops = 99;
+        registry.insert(quarantined).unwrap();
+
+        let mut transport = MockTransport::new();
+        let mut frame_buf = [0u8; MAX_PACKET_SIZE];
+        let mut packet = valid_connect();
+        packet.clean_session = false;
+
+        let resumed_id = block_on(handle_connect(
+            &mut transport,
+            &mut registry,
+            &packet,
+            &house_token(),
+            &mut frame_buf,
+        ))
+        .unwrap();
+
+        let session = registry.get(resumed_id).unwrap();
+        assert!(!session.quarantined, "quarantine must be cleared on reconnect");
+        assert_eq!(session.outbox_drops, 0);
     }
 
     #[test]
