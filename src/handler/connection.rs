@@ -216,17 +216,25 @@ pub async fn connection_loop<
 
                 match packet {
                     Packet::Publish(publish) => {
-                        let mut registry = registry.lock().await;
-                        let mut retained = retained.lock().await;
-                        match handle_publish(
-                            session_id,
-                            &mut registry,
-                            &mut retained,
-                            command_handler,
-                            &publish,
-                        )
-                        .await
-                        {
+                        let puback_pid = match publish.qospid {
+                            QosPid::AtLeastOnce(pid) => Some(pid),
+                            _ => None,
+                        };
+
+                        let publish_result = {
+                            let mut registry = registry.lock().await;
+                            let mut retained = retained.lock().await;
+                            handle_publish(
+                                session_id,
+                                &mut registry,
+                                &mut retained,
+                                command_handler,
+                                &publish,
+                            )
+                            .await
+                        };
+
+                        match publish_result {
                             Err(PublishError::RateLimitDisconnect) => {
                                 break DisconnectReason::RateLimitExceeded;
                             }
@@ -234,6 +242,19 @@ pub async fn connection_loop<
                                 break DisconnectReason::CommandHandlerOverloaded;
                             }
                             _ => {}
+                        }
+
+                        if let Some(pid) = puback_pid {
+                            if crate::codec::frame::write_packet(
+                                transport,
+                                &Packet::Puback(pid),
+                                &mut write_buf,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break DisconnectReason::TransportError;
+                            }
                         }
                     }
                     Packet::Puback(pid) => {
@@ -828,6 +849,39 @@ mod tests {
         ));
 
         assert!(block_on(registry.lock()).find_by_client_id("mobile-app").is_none());
+    }
+
+    #[test]
+    fn qos1_publish_sends_puback_to_sender() {
+        let mut transport = AsyncMockTransport::new();
+        transport.feed(encode_packet(&connect_packet("mobile-app", 60)).as_slice());
+        transport.feed(
+            encode_packet(&publish_packet(
+                "test/topic",
+                b"hello",
+                QosPid::AtLeastOnce(Pid::try_from(5).unwrap()),
+            ))
+            .as_slice(),
+        );
+        transport.feed(encode_packet(&Packet::Disconnect).as_slice());
+        transport.finish();
+
+        let registry = Mutex::<CriticalSectionRawMutex, _>::new(SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new());
+        let retained = Mutex::<CriticalSectionRawMutex, _>::new(RetainedStore::<MAX_RETAINED>::new());
+        let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, INBOUND_N>::new();
+        let mut frame_buf = [0u8; MAX_PACKET_SIZE];
+
+        block_on(connection_loop(
+            &mut transport,
+            &registry,
+            &retained,
+            &inbound,
+            &config(),
+            &mut frame_buf,
+        ));
+
+        let tx = transport.tx_log();
+        assert!(tx.iter().any(|frame| frame == &vec![0x40, 0x02, 0x00, 0x05]));
     }
 
     #[test]

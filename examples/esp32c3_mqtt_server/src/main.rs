@@ -10,7 +10,6 @@ use core::future::pending;
 #[cfg(not(feature = "tls"))]
 use core::ptr::NonNull;
 use core::str;
-use embassy_futures::select::{select, Either};
 
 use embassy_executor::Spawner;
 use embassy_net::tcp::TcpSocket;
@@ -25,19 +24,13 @@ use esp_alloc::heap_allocator;
 use esp_alloc::HEAP;
 use esp_backtrace as _;
 use esp_println::println;
-use gatomqtt::codec::frame::write_packet;
-use gatomqtt::codec::frame::{read_packet, ReadError};
 use gatomqtt::config::GATOMQTT_CONFIG;
-use gatomqtt::handler::connect::{prepare_connect, write_connack, HouseToken, PreparedConnect};
-use gatomqtt::handler::pingreq::touch_pingreq;
-use gatomqtt::handler::publish::{handle_publish, MqttIntent, PublishError};
-use gatomqtt::handler::subscribe::{
-    apply_unsubscribe, prepare_subscribe, write_prepared_subscribe,
-};
+use gatomqtt::handler::command::MqttIntent;
+use gatomqtt::handler::connection::connection_loop;
 use gatomqtt::router::RetainedStore;
 use gatomqtt::session::registry::SessionRegistry;
+#[cfg(feature = "tls")]
 use gatomqtt::transport::Transport as _;
-use mqttrs::{Packet, PacketType};
 
 mod bootstrap;
 #[cfg(feature = "tls")]
@@ -200,7 +193,6 @@ impl WorkerSocketSlot {
 #[cfg(feature = "tls")]
 struct WorkerFrameBuffers {
     read: UnsafeCell<[u8; MAX_PACKET_SIZE]>,
-    write: UnsafeCell<[u8; MAX_PACKET_SIZE]>,
 }
 
 #[cfg(feature = "tls")]
@@ -211,17 +203,11 @@ impl WorkerFrameBuffers {
     const fn new() -> Self {
         Self {
             read: UnsafeCell::new([0; MAX_PACKET_SIZE]),
-            write: UnsafeCell::new([0; MAX_PACKET_SIZE]),
         }
     }
 
-    fn borrow(
-        &'static self,
-    ) -> (
-        &'static mut [u8; MAX_PACKET_SIZE],
-        &'static mut [u8; MAX_PACKET_SIZE],
-    ) {
-        unsafe { (&mut *self.read.get(), &mut *self.write.get()) }
+    fn borrow(&'static self) -> &'static mut [u8; MAX_PACKET_SIZE] {
+        unsafe { &mut *self.read.get() }
     }
 }
 
@@ -397,7 +383,7 @@ async fn mqtt_tls_worker_body(
         );
         log_tls_heap("worker accepted");
 
-        let (read_buf, write_buf) = WORKER_FRAME_BUFFERS[slot].borrow();
+        let frame_buf = WORKER_FRAME_BUFFERS[slot].borrow();
         let tcp_transport = TcpTransport::new(&mut socket);
         let mut transport = match TlsTransport::new(tls.reference(), tcp_transport, tls_config) {
             Ok(transport) => transport,
@@ -420,27 +406,17 @@ async fn mqtt_tls_worker_body(
         log_tls_heap("handshake ok");
         println!("[TLS WORKER {}] Handshake complete", slot);
 
-        let session_id = Box::pin(accept_plain_connect(&mut transport, read_buf, write_buf)).await;
+        let config = gatomqtt_config();
+        Box::pin(connection_loop(
+            &mut transport,
+            plain_registry(),
+            plain_retained(),
+            plain_inbound(),
+            &config,
+            frame_buf,
+        ))
+        .await;
 
-        if let Some(session_id) = session_id {
-            loop {
-                let keep_running = Box::pin(run_plain_session_step(
-                    session_id,
-                    &mut transport,
-                    read_buf,
-                    write_buf,
-                ))
-                .await;
-                if !keep_running {
-                    break;
-                }
-            }
-
-            let mut registry = plain_registry().lock().await;
-            let _ = registry.remove(session_id);
-        }
-
-        transport.close().await;
         println!("[TLS WORKER {}] Connection closed", slot);
         log_tls_heap("closed");
         release_worker_slot(slot, busy_flag, "TLS WORKER").await;
@@ -562,267 +538,22 @@ async fn plain_worker(stack: Stack<'static>) {
         }
         println!("[PLAIN WORKER] Accepted {:?}", socket.remote_endpoint());
 
-        let mut read_buf = [0u8; MAX_PACKET_SIZE];
-        let mut write_buf = [0u8; MAX_PACKET_SIZE];
+        let mut frame_buf = [0u8; MAX_PACKET_SIZE];
         let mut transport = TcpTransport::new(&mut socket);
 
-        let session_id = Box::pin(accept_plain_connect(
+        let config = gatomqtt_config();
+        Box::pin(connection_loop(
             &mut transport,
-            &mut read_buf,
-            &mut write_buf,
+            plain_registry(),
+            plain_retained(),
+            plain_inbound(),
+            &config,
+            &mut frame_buf,
         ))
         .await;
 
-        if let Some(session_id) = session_id {
-            loop {
-                let keep_running = Box::pin(run_plain_session_step(
-                    session_id,
-                    &mut transport,
-                    &mut read_buf,
-                    &mut write_buf,
-                ))
-                .await;
-                if !keep_running {
-                    break;
-                }
-            }
-            let mut registry = plain_registry().lock().await;
-            let _ = registry.remove(session_id);
-        }
-
-        transport.close().await;
         println!("[PLAIN WORKER] Connection closed");
         // socket → bufs freed
-    }
-}
-
-// ── CONNECT / session logic ───────────────────────────────────────────────────
-
-async fn accept_plain_connect(
-    transport: &mut impl gatomqtt::transport::Transport,
-    read_buf: &mut [u8; MAX_PACKET_SIZE],
-    write_buf: &mut [u8; MAX_PACKET_SIZE],
-) -> Option<usize> {
-    match read_packet(transport, read_buf).await {
-        Ok(Packet::Connect(connect)) => {
-            println!("[CONNECT] packet received");
-            let config = gatomqtt_config();
-            let token = HouseToken {
-                username: config.house_token_username,
-                password: config.house_token_password,
-            };
-            let connect_result = {
-                let mut registry = plain_registry().lock().await;
-                prepare_connect(&mut registry, &connect, &token)
-            };
-            match connect_result {
-                Ok(PreparedConnect::Accepted(outcome)) => {
-                    if write_connack(transport, mqttrs::ConnectReturnCode::Accepted, write_buf)
-                        .await
-                        .is_err()
-                    {
-                        let _ = transport.close().await;
-                        return None;
-                    }
-                    mark_plain_activity(outcome.session_id).await;
-                    println!("[CONNECT] accepted session={}", outcome.session_id);
-                    Some(outcome.session_id)
-                }
-                Ok(PreparedConnect::Rejected(code)) => {
-                    let _ = write_connack(transport, code, write_buf).await;
-                    let _ = transport.close().await;
-                    println!("[CONNECT] rejected");
-                    None
-                }
-                Err(_) => {
-                    let _ = transport.close().await;
-                    println!("[CONNECT] error");
-                    None
-                }
-            }
-        }
-        Ok(other) => {
-            println!("[CONNECT] first packet not CONNECT: {:?}", other);
-            let _ = transport.close().await;
-            None
-        }
-        Err(ReadError::Eof) => {
-            println!("[CONNECT] EOF before first packet");
-            let _ = transport.close().await;
-            None
-        }
-        Err(err) => {
-            println!("[CONNECT] read error: {:?}", err);
-            let _ = transport.close().await;
-            None
-        }
-    }
-}
-
-async fn run_plain_session_step(
-    session_id: usize,
-    transport: &mut impl gatomqtt::transport::Transport,
-    read_buf: &mut [u8; MAX_PACKET_SIZE],
-    write_buf: &mut [u8; MAX_PACKET_SIZE],
-) -> bool {
-    if flush_plain_outbox(session_id, plain_registry(), transport)
-        .await
-        .is_err()
-    {
-        println!("[SESSION {}] outbox flush failed", session_id);
-        return false;
-    }
-
-    match select(
-        read_packet(transport, read_buf),
-        embassy_time::Timer::after(embassy_time::Duration::from_millis(200)),
-    )
-    .await
-    {
-        Either::First(Ok(packet)) => {
-            if !mark_plain_activity(session_id).await {
-                println!("[SESSION {}] missing before packet handling", session_id);
-                return false;
-            }
-            handle_plain_session_packet(session_id, transport, packet, write_buf).await
-        }
-        Either::First(Err(ReadError::Eof)) => {
-            println!("[SESSION {}] peer closed", session_id);
-            false
-        }
-        Either::First(Err(err)) => {
-            println!("[SESSION {}] read error: {:?}", session_id, err);
-            false
-        }
-        Either::Second(_) => {
-            if is_plain_keepalive_expired(session_id).await {
-                println!("[SESSION {}] keepalive expired", session_id);
-                false
-            } else {
-                true
-            }
-        }
-    }
-}
-
-async fn handle_plain_session_packet(
-    session_id: usize,
-    transport: &mut impl gatomqtt::transport::Transport,
-    packet: Packet<'_>,
-    write_buf: &mut [u8; MAX_PACKET_SIZE],
-) -> bool {
-    match packet.get_type() {
-        PacketType::Disconnect => {
-            println!("[SESSION {}] DISCONNECT", session_id);
-            false
-        }
-        PacketType::Subscribe => {
-            let Packet::Subscribe(subscribe) = packet else {
-                unreachable!()
-            };
-            println!("[SESSION {}] SUBSCRIBE", session_id);
-            let prepared = {
-                let mut registry = plain_registry().lock().await;
-                let retained = plain_retained().lock().await;
-                let Some(session) = registry.get_mut(session_id) else {
-                    println!("[SESSION {}] missing during SUBSCRIBE", session_id);
-                    return false;
-                };
-                prepare_subscribe(session, &subscribe, &retained)
-            };
-            match write_prepared_subscribe(transport, &prepared, write_buf).await {
-                Ok(()) => {
-                    println!("[SESSION {}] SUBACK sent", session_id);
-                    true
-                }
-                Err(_) => {
-                    println!("[SESSION {}] SUBSCRIBE write failed", session_id);
-                    false
-                }
-            }
-        }
-        PacketType::Unsubscribe => {
-            let Packet::Unsubscribe(unsubscribe) = packet else {
-                unreachable!()
-            };
-            println!("[SESSION {}] UNSUBSCRIBE", session_id);
-            {
-                let mut registry = plain_registry().lock().await;
-                let Some(session) = registry.get_mut(session_id) else {
-                    println!("[SESSION {}] missing during UNSUBSCRIBE", session_id);
-                    return false;
-                };
-                apply_unsubscribe(session, &unsubscribe);
-            }
-            match write_packet(transport, &Packet::Unsuback(unsubscribe.pid), write_buf).await {
-                Ok(()) => {
-                    println!("[SESSION {}] UNSUBACK sent", session_id);
-                    true
-                }
-                Err(_) => {
-                    println!("[SESSION {}] UNSUBSCRIBE write failed", session_id);
-                    false
-                }
-            }
-        }
-        PacketType::Pingreq => {
-            println!("[SESSION {}] PINGREQ", session_id);
-            {
-                let mut registry = plain_registry().lock().await;
-                let Some(session) = registry.get_mut(session_id) else {
-                    println!("[SESSION {}] missing during PINGREQ", session_id);
-                    return false;
-                };
-                touch_pingreq(session);
-            }
-            match write_packet(transport, &Packet::Pingresp, write_buf).await {
-                Ok(()) => {
-                    println!("[SESSION {}] PINGRESP sent", session_id);
-                    true
-                }
-                Err(_) => {
-                    println!("[SESSION {}] PINGREQ write failed", session_id);
-                    false
-                }
-            }
-        }
-        PacketType::Publish => {
-            let Packet::Publish(publish) = packet else {
-                unreachable!()
-            };
-            println!("[SESSION {}] PUBLISH", session_id);
-            let mut registry = plain_registry().lock().await;
-            let mut retained = plain_retained().lock().await;
-            match handle_publish(
-                session_id,
-                &mut registry,
-                &mut retained,
-                plain_inbound(),
-                &publish,
-            )
-            .await
-            {
-                Ok(()) => {
-                    println!("[SESSION {}] PUBLISH handled", session_id);
-                    true
-                }
-                Err(PublishError::RateLimitDisconnect) => {
-                    println!("[SESSION {}] rate limit disconnect", session_id);
-                    false
-                }
-                Err(err) => {
-                    println!("[SESSION {}] PUBLISH failed: {:?}", session_id, err);
-                    false
-                }
-            }
-        }
-        other => {
-            println!(
-                "[SESSION {}] unhandled packet type: {:?}",
-                session_id, other
-            );
-            true
-        }
     }
 }
 
@@ -943,45 +674,4 @@ fn plain_retained() -> &'static Mutex<CriticalSectionRawMutex, Retained> {
 
 fn plain_inbound() -> &'static Inbound {
     &INBOUND_MUTEX
-}
-
-async fn flush_plain_outbox(
-    session_id: usize,
-    registry: &'static Mutex<CriticalSectionRawMutex, Registry>,
-    transport: &mut impl gatomqtt::transport::Transport,
-) -> Result<(), ()> {
-    loop {
-        let next_bytes = {
-            let mut registry = registry.lock().await;
-            let Some(session) = registry.get_mut(session_id) else {
-                return Err(());
-            };
-            if session.outbox.is_empty() {
-                None
-            } else {
-                Some(session.outbox.remove(0).bytes)
-            }
-        };
-        let Some(bytes) = next_bytes else {
-            return Ok(());
-        };
-        transport.write(bytes.as_slice()).await.map_err(|_| ())?;
-    }
-}
-
-async fn mark_plain_activity(session_id: usize) -> bool {
-    let mut registry = plain_registry().lock().await;
-    let Some(session) = registry.get_mut(session_id) else {
-        return false;
-    };
-    session.update_activity();
-    true
-}
-
-async fn is_plain_keepalive_expired(session_id: usize) -> bool {
-    let registry = plain_registry().lock().await;
-    let Some(session) = registry.get(session_id) else {
-        return true;
-    };
-    session.is_keepalive_expired(embassy_time::Instant::now())
 }
