@@ -1,3 +1,4 @@
+use crate::qos::max_qos;
 use crate::router::{topic_matches, RetainedError, RetainedStore};
 use crate::session::registry::SessionRegistry;
 use crate::session::state::{LwtMessage, SessionId, SessionState};
@@ -73,13 +74,41 @@ pub async fn publish_lwt_if_needed<
         return Ok(());
     };
 
+    publish_lwt_message_if_needed(
+        session.client_id.as_str(),
+        lwt,
+        registry,
+        retained,
+        broadcaster,
+        reason,
+    )
+    .await
+}
+
+pub async fn publish_lwt_message_if_needed<
+    const MAX_SESSIONS: usize,
+    const MAX_SUBS: usize,
+    const MAX_INFLIGHT: usize,
+    const MAX_RETAINED: usize,
+>(
+    disconnecting_client_id: &str,
+    lwt: &LwtMessage,
+    registry: &SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>,
+    retained: &mut RetainedStore<MAX_RETAINED>,
+    broadcaster: &dyn LwtBroadcaster,
+    reason: DisconnectReason,
+) -> Result<(), DisconnectError> {
+    if reason.is_clean() {
+        return Ok(());
+    }
+
     if lwt.retain {
         retained
             .set(lwt.topic.as_str(), lwt.payload.as_slice(), lwt.qos)
             .map_err(DisconnectError::Retained)?;
     }
 
-    let deliveries = find_lwt_subscribers(registry, session.client_id.as_str(), lwt);
+    let deliveries = find_lwt_subscribers(registry, disconnecting_client_id, lwt);
     if deliveries.is_empty() {
         return Ok(());
     }
@@ -121,22 +150,6 @@ fn find_lwt_subscribers<
     }
 
     deliveries
-}
-
-fn max_qos(lhs: QoS, rhs: QoS) -> QoS {
-    if qos_rank(lhs) >= qos_rank(rhs) {
-        lhs
-    } else {
-        rhs
-    }
-}
-
-const fn qos_rank(qos: QoS) -> u8 {
-    match qos {
-        QoS::AtMostOnce => 0,
-        QoS::AtLeastOnce => 1,
-        QoS::ExactlyOnce => 2,
-    }
 }
 
 #[cfg(test)]

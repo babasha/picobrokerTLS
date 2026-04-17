@@ -6,6 +6,7 @@ extern crate std;
 pub mod codec;
 pub mod config;
 pub mod handler;
+pub mod qos;
 pub mod router;
 #[path = "session/mod.rs"]
 pub mod session;

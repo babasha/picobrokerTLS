@@ -59,7 +59,16 @@ pub enum TlsTransportError<E: core::fmt::Debug> {
 /// // Handshake before handing off to the broker.
 /// transport.accept().await?;
 ///
-/// connection_loop(&mut transport, &registry, &retained, &inbound, &config, &mut frame_buf).await;
+/// connection_loop(
+///     &mut transport,
+///     &registry,
+///     &retained,
+///     &outbox_signals,
+///     &inbound,
+///     &config,
+///     &mut frame_buf,
+/// )
+/// .await;
 /// ```
 pub struct TlsTransport<S> {
     session: S,

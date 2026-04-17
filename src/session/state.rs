@@ -1,7 +1,7 @@
 use crate::config::GATOMQTT_CONFIG;
 use super::rate_limit::TokenBucket;
 use embassy_time::{Duration, Instant};
-use heapless::{String, Vec};
+use heapless::{Deque, String, Vec};
 use mqttrs::QoS;
 
 pub const MAX_OUTBOUND_FRAME_SIZE: usize = 192;
@@ -10,12 +10,12 @@ pub const MAX_OUTBOX_DEPTH: usize = 8;
 pub type SessionId = usize;
 pub type ClientId = String<64>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SessionState<const MAX_SUBS: usize, const MAX_INFLIGHT: usize> {
     pub client_id: ClientId,
     pub subscriptions: Vec<Subscription, MAX_SUBS>,
     pub inflight: Vec<InflightEntry, MAX_INFLIGHT>,
-    pub outbox: Vec<OutboundPacket, MAX_OUTBOX_DEPTH>,
+    pub outbox: Deque<OutboundPacket, MAX_OUTBOX_DEPTH>,
     pub rate: TokenBucket,
     pub keepalive_secs: u16,
     pub last_activity: Instant,
@@ -38,11 +38,16 @@ pub struct Subscription {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InflightEntry {
     pub packet_id: u16,
-    pub payload: Vec<u8, 512>,
-    pub topic: String<128>,
+    pub publish: StoredPublishHandle,
     pub qos: QoS,
     pub sent_at: Instant,
     pub retries: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredPublishHandle {
+    pub(crate) slot: usize,
+    pub(crate) generation: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,13 +63,36 @@ pub struct OutboundPacket {
     pub bytes: Vec<u8, MAX_OUTBOUND_FRAME_SIZE>,
 }
 
+impl<const MAX_SUBS: usize, const MAX_INFLIGHT: usize> PartialEq
+    for SessionState<MAX_SUBS, MAX_INFLIGHT>
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.client_id == other.client_id
+            && self.subscriptions == other.subscriptions
+            && self.inflight == other.inflight
+            && self.outbox.iter().eq(other.outbox.iter())
+            && self.rate == other.rate
+            && self.keepalive_secs == other.keepalive_secs
+            && self.last_activity == other.last_activity
+            && self.lwt == other.lwt
+            && self.outbox_drops == other.outbox_drops
+            && self.quarantined == other.quarantined
+            && self.next_packet_id == other.next_packet_id
+    }
+}
+
+impl<const MAX_SUBS: usize, const MAX_INFLIGHT: usize> Eq
+    for SessionState<MAX_SUBS, MAX_INFLIGHT>
+{
+}
+
 impl<const MAX_SUBS: usize, const MAX_INFLIGHT: usize> SessionState<MAX_SUBS, MAX_INFLIGHT> {
     pub fn new(client_id: ClientId, keepalive_secs: u16) -> Self {
         Self {
             client_id,
             subscriptions: Vec::new(),
             inflight: Vec::new(),
-            outbox: Vec::new(),
+            outbox: Deque::new(),
             rate: TokenBucket::new(GATOMQTT_CONFIG.rate_capacity, GATOMQTT_CONFIG.rate_per_sec),
             keepalive_secs,
             last_activity: Instant::from_ticks(0),
@@ -80,16 +108,19 @@ impl<const MAX_SUBS: usize, const MAX_INFLIGHT: usize> SessionState<MAX_SUBS, MA
     }
 
     pub fn inflight_ack(&mut self, packet_id: u16) -> bool {
+        self.inflight_remove(packet_id).is_some()
+    }
+
+    pub fn inflight_remove(&mut self, packet_id: u16) -> Option<InflightEntry> {
         let Some(index) = self
             .inflight
             .iter()
             .position(|entry| entry.packet_id == packet_id)
         else {
-            return false;
+            return None;
         };
 
-        self.inflight.remove(index);
-        true
+        Some(self.inflight.remove(index))
     }
 
     pub fn inflight_expired<'a>(
@@ -124,7 +155,7 @@ impl<const MAX_SUBS: usize, const MAX_INFLIGHT: usize> SessionState<MAX_SUBS, MA
 
     /// Returns how long the connection loop should sleep before its next wakeup.
     ///
-    /// Clamps to `max_wait` (the outbox polling interval), then tightens to:
+    /// Clamps to `max_wait` (a defensive upper bound), then tightens to:
     /// - the time remaining until keepalive expires, and
     /// - the time remaining until the earliest inflight QoS-1 retry is due.
     ///
@@ -187,16 +218,18 @@ impl<const MAX_SUBS: usize, const MAX_INFLIGHT: usize> SessionState<MAX_SUBS, MA
 
 #[cfg(test)]
 mod tests {
-    use super::{InflightEntry, SessionState};
+    use super::{InflightEntry, SessionState, StoredPublishHandle};
     use embassy_time::{Duration, Instant};
-    use heapless::{String, Vec};
+    use heapless::String;
     use mqttrs::QoS;
 
     fn inflight_entry(packet_id: u16, sent_at: Instant) -> InflightEntry {
         InflightEntry {
             packet_id,
-            payload: Vec::<u8, 512>::from_slice(b"hello").unwrap(),
-            topic: String::<128>::try_from("devices/kitchen/temp").unwrap(),
+            publish: StoredPublishHandle {
+                slot: 0,
+                generation: 1,
+            },
             qos: QoS::AtLeastOnce,
             sent_at,
             retries: 0,

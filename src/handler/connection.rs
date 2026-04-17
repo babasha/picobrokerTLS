@@ -2,10 +2,10 @@ use crate::codec::frame::{read_packet, ReadError};
 use crate::config::BrokerConfig;
 use crate::handler::connect::{prepare_connect, write_connack, HouseToken, PreparedConnect};
 use crate::handler::disconnect::{
-    publish_lwt_if_needed, DisconnectReason, LwtBroadcaster, LwtBroadcastError,
+    publish_lwt_message_if_needed, DisconnectReason, LwtBroadcaster, LwtBroadcastError,
 };
-use crate::handler::pingreq::touch_pingreq;
 use crate::handler::command::CommandHandler;
+use crate::handler::pingreq::touch_pingreq;
 use crate::handler::publish::{
     handle_puback, handle_publish, process_inflight_retries, PublishError,
 };
@@ -13,6 +13,7 @@ use crate::handler::subscribe::{
     apply_unsubscribe, prepare_subscribe, write_prepared_subscribe,
 };
 use crate::router::RetainedStore;
+use crate::session::notify::{signal_session, SessionSignals};
 use crate::session::rate_limit::TokenBucket;
 use crate::session::registry::SessionRegistry;
 use crate::session::state::{LwtMessage, OutboundPacket, SessionId, MAX_OUTBOUND_FRAME_SIZE};
@@ -77,6 +78,7 @@ pub async fn connection_loop<
     transport: &mut T,
     registry: &Mutex<M, SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>>,
     retained: &Mutex<M, RetainedStore<MAX_RETAINED>>,
+    outbox_signals: &SessionSignals<MAX_SESSIONS>,
     command_handler: &H,
     config: &BrokerConfig,
     frame_buf: &mut [u8; MAX_PACKET_SIZE],
@@ -162,19 +164,20 @@ pub async fn connection_loop<
             break DisconnectReason::TransportError;
         }
 
-        {
+        let timer_after = {
             let mut registry = registry.lock().await;
-            let Some(session) = registry.get_mut(session_id) else {
+            let Some(quarantined) = registry.get(session_id).map(|session| session.quarantined) else {
                 break DisconnectReason::ConnectionClosed;
             };
 
-            if session.quarantined {
+            if quarantined {
                 defmt::warn!("mqtt connection_loop: session quarantined; disconnecting slow subscriber");
                 break DisconnectReason::OutboxQuarantine;
             }
 
             if process_inflight_retries(
-                session,
+                session_id,
+                &mut registry,
                 transport,
                 &mut write_buf,
                 config.qos1_retry_ms,
@@ -186,34 +189,30 @@ pub async fn connection_loop<
                 break DisconnectReason::RetryLimitExceeded;
             }
 
-            if session.is_keepalive_expired(embassy_time::Instant::now()) {
-                break DisconnectReason::KeepaliveTimeout;
-            }
-        }
-
-        let timer_after = {
-            let registry = registry.lock().await;
+            let now = embassy_time::Instant::now();
             let Some(session) = registry.get(session_id) else {
                 break DisconnectReason::ConnectionClosed;
             };
+
+            if session.is_keepalive_expired(now) {
+                break DisconnectReason::KeepaliveTimeout;
+            }
+
             session.next_wakeup_after(
-                embassy_time::Instant::now(),
+                now,
                 config.qos1_retry_ms,
-                Duration::from_millis(50),
+                Duration::from_secs(3_600),
             )
         };
+        let outbox_signal = &outbox_signals[session_id];
 
         match select(
             read_packet(transport, frame_buf),
-            Timer::after(timer_after),
+            select(Timer::after(timer_after), outbox_signal.wait()),
         )
         .await
         {
             Either::First(Ok(packet)) => {
-                if touch_session_activity(session_id, registry).await.is_err() {
-                    break DisconnectReason::ConnectionClosed;
-                }
-
                 match packet {
                     Packet::Publish(publish) => {
                         let puback_pid = match publish.qospid {
@@ -224,10 +223,15 @@ pub async fn connection_loop<
                         let publish_result = {
                             let mut registry = registry.lock().await;
                             let mut retained = retained.lock().await;
+                            let Some(session) = registry.get_mut(session_id) else {
+                                break DisconnectReason::ConnectionClosed;
+                            };
+                            session.update_activity();
                             handle_publish(
                                 session_id,
                                 &mut registry,
                                 &mut retained,
+                                outbox_signals,
                                 command_handler,
                                 &publish,
                             )
@@ -260,7 +264,10 @@ pub async fn connection_loop<
                     Packet::Puback(pid) => {
                         let mut registry = registry.lock().await;
                         if let Some(session) = registry.get_mut(session_id) {
-                            handle_puback(session, pid.get());
+                            session.update_activity();
+                            if let Some(publish) = handle_puback(session, pid.get()) {
+                                registry.release_stored_publish(publish);
+                            }
                         } else {
                             break DisconnectReason::ConnectionClosed;
                         }
@@ -272,6 +279,7 @@ pub async fn connection_loop<
                             let Some(session) = registry.get_mut(session_id) else {
                                 break DisconnectReason::ConnectionClosed;
                             };
+                            session.update_activity();
                             prepare_subscribe(session, &subscribe, &retained)
                         };
                         if write_prepared_subscribe(transport, &prepared, &mut write_buf)
@@ -287,6 +295,7 @@ pub async fn connection_loop<
                             let Some(session) = registry.get_mut(session_id) else {
                                 break DisconnectReason::ConnectionClosed;
                             };
+                            session.update_activity();
                             apply_unsubscribe(session, &unsubscribe);
                         }
                         if crate::codec::frame::write_packet(
@@ -323,7 +332,13 @@ pub async fn connection_loop<
                         defmt::info!("mqtt connection_loop: DISCONNECT received");
                         break DisconnectReason::ClientDisconnect;
                     }
-                    _ => {}
+                    _ => {
+                        let mut registry = registry.lock().await;
+                        let Some(session) = registry.get_mut(session_id) else {
+                            break DisconnectReason::ConnectionClosed;
+                        };
+                        session.update_activity();
+                    }
                 }
             }
             Either::First(Err(ReadError::Eof)) => {
@@ -345,25 +360,9 @@ pub async fn connection_loop<
         transport,
         registry,
         retained,
+        outbox_signals,
     )
     .await;
-}
-
-async fn touch_session_activity<
-    M: RawMutex,
-    const MAX_SESSIONS: usize,
-    const MAX_SUBS: usize,
-    const MAX_INFLIGHT: usize,
->(
-    session_id: SessionId,
-    registry: &Mutex<M, SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>>,
-) -> Result<(), ()> {
-    let mut registry = registry.lock().await;
-    let Some(session) = registry.get_mut(session_id) else {
-        return Err(());
-    };
-    session.update_activity();
-    Ok(())
 }
 
 async fn flush_outbox_for_session<
@@ -390,7 +389,7 @@ async fn flush_outbox_for_session<
                 session.outbox_drops = 0;
                 None
             } else {
-                Some(session.outbox.remove(0))
+                session.outbox.pop_front()
             }
         };
 
@@ -415,38 +414,49 @@ async fn cleanup_connection<
     transport: &mut T,
     registry: &Mutex<M, SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>>,
     retained: &Mutex<M, RetainedStore<MAX_RETAINED>>,
+    outbox_signals: &SessionSignals<MAX_SESSIONS>,
 ) {
-    let session_snapshot = {
-        let registry = registry.lock().await;
-        registry.get(session_id).cloned()
+    let lwt_delivery = if reason.is_clean() {
+        None
+    } else {
+        let registry_guard = registry.lock().await;
+        if let Some(session) = registry_guard.get(session_id) {
+            if let Some(lwt) = session.lwt.clone() {
+                let broadcaster = RecordingLwtBroadcaster::<16>::new();
+                {
+                    let mut retained_guard = retained.lock().await;
+                    let _ = publish_lwt_message_if_needed(
+                        session.client_id.as_str(),
+                        &lwt,
+                        &registry_guard,
+                        &mut retained_guard,
+                        &broadcaster,
+                        reason,
+                    )
+                    .await;
+                }
+
+                broadcaster.take().map(|recorded| (lwt, recorded))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     };
 
-    if let Some(session) = session_snapshot {
-        let broadcaster = RecordingLwtBroadcaster::<16>::new();
-        {
-            let registry_guard = registry.lock().await;
-            let mut retained_guard = retained.lock().await;
-            let _ = publish_lwt_if_needed(
-                &session,
-                &registry_guard,
-                &mut retained_guard,
-                &broadcaster,
-                reason,
-            )
-            .await;
-        }
-
-        if let Some(recorded) = broadcaster.take() {
-            let mut registry = registry.lock().await;
-            for (target_session_id, qos) in recorded.deliveries {
-                let Some(target) = registry.get_mut(target_session_id) else {
-                    continue;
-                };
-                let bytes = match encode_publish_from_lwt(&session.lwt, qos) {
-                    Some(bytes) => bytes,
-                    None => continue,
-                };
-                let _ = target.outbox.push(OutboundPacket { bytes });
+    if let Some((lwt, recorded)) = lwt_delivery {
+        let mut registry = registry.lock().await;
+        for (target_session_id, qos) in recorded.deliveries {
+            let Some(target) = registry.get_mut(target_session_id) else {
+                continue;
+            };
+            let bytes = match encode_publish_from_lwt(&lwt, qos) {
+                Some(bytes) => bytes,
+                None => continue,
+            };
+            if target.outbox.push_back(OutboundPacket { bytes }).is_ok() {
+                signal_session(outbox_signals, target_session_id);
             }
         }
     }
@@ -460,10 +470,9 @@ async fn cleanup_connection<
 }
 
 fn encode_publish_from_lwt(
-    lwt: &Option<LwtMessage>,
+    lwt: &LwtMessage,
     qos: mqttrs::QoS,
 ) -> Option<Vec<u8, MAX_OUTBOUND_FRAME_SIZE>> {
-    let lwt = lwt.as_ref()?;
     let mut frame = [0u8; MAX_OUTBOUND_FRAME_SIZE];
     let qospid = match qos {
         mqttrs::QoS::AtMostOnce => QosPid::AtMostOnce,
@@ -487,6 +496,7 @@ mod tests {
     use crate::config::BrokerConfig;
     use crate::handler::command::MqttIntent;
     use crate::router::RetainedStore;
+    use crate::session::notify::{new_session_signals, SessionSignals};
     use crate::session::registry::SessionRegistry;
     use crate::session::state::{InflightEntry, SessionState, Subscription};
     use crate::transport::Transport;
@@ -500,6 +510,7 @@ mod tests {
     use mqttrs::{
         Connect, LastWill, Packet, Pid, Protocol, Publish, QosPid, QoS, Subscribe, SubscribeTopic,
     };
+    use std::boxed::Box;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex as StdMutex};
     use std::task::Waker;
@@ -514,6 +525,10 @@ mod tests {
     const MAX_RETAINED: usize = 64;
     const INBOUND_N: usize = 8;
     const MAX_PACKET_SIZE: usize = 512;
+
+    fn outbox_signals() -> SessionSignals<MAX_SESSIONS> {
+        new_session_signals()
+    }
 
     #[derive(Default)]
     struct TransportState {
@@ -688,12 +703,14 @@ mod tests {
         let registry = Mutex::<CriticalSectionRawMutex, _>::new(SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new());
         let retained = Mutex::<CriticalSectionRawMutex, _>::new(RetainedStore::<MAX_RETAINED>::new());
         let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, INBOUND_N>::new();
+        let outbox_signals = outbox_signals();
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
 
         block_on(connection_loop(
             &mut transport,
             &registry,
             &retained,
+            &outbox_signals,
             &inbound,
             &config(),
             &mut frame_buf,
@@ -717,12 +734,14 @@ mod tests {
         let registry = Mutex::<CriticalSectionRawMutex, _>::new(SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new());
         let retained = Mutex::<CriticalSectionRawMutex, _>::new(RetainedStore::<MAX_RETAINED>::new());
         let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, INBOUND_N>::new();
+        let outbox_signals = outbox_signals();
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
 
         block_on(connection_loop(
             &mut transport,
             &registry,
             &retained,
+            &outbox_signals,
             &inbound,
             &config(),
             &mut frame_buf,
@@ -743,12 +762,14 @@ mod tests {
         let registry = Mutex::<CriticalSectionRawMutex, _>::new(SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new());
         let retained = Mutex::<CriticalSectionRawMutex, _>::new(RetainedStore::<MAX_RETAINED>::new());
         let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, INBOUND_N>::new();
+        let outbox_signals = outbox_signals();
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
 
         block_on(connection_loop(
             &mut transport,
             &registry,
             &retained,
+            &outbox_signals,
             &inbound,
             &config(),
             &mut frame_buf,
@@ -779,12 +800,15 @@ mod tests {
                 .unwrap();
         }
 
+        let outbox_signals: &'static SessionSignals<MAX_SESSIONS> =
+            Box::leak(Box::new(outbox_signals()));
         let registry_for_thread = registry.clone();
         thread::spawn(move || loop {
             let mut guard = block_on(registry_for_thread.lock());
             if let Some(session_id) = guard.find_by_client_id("mobile-app") {
                 guard.get_mut(session_id).unwrap().last_activity =
                     Instant::now().checked_sub(Duration::from_secs(120)).unwrap();
+                outbox_signals[session_id].signal(());
                 break;
             }
             drop(guard);
@@ -798,6 +822,7 @@ mod tests {
             &mut transport,
             &registry,
             &retained,
+            &outbox_signals,
             &inbound,
             &config(),
             &mut frame_buf,
@@ -837,12 +862,14 @@ mod tests {
         let registry = Mutex::<CriticalSectionRawMutex, _>::new(SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new());
         let retained = Mutex::<CriticalSectionRawMutex, _>::new(RetainedStore::<MAX_RETAINED>::new());
         let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, INBOUND_N>::new();
+        let outbox_signals = outbox_signals();
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
 
         block_on(connection_loop(
             &mut transport,
             &registry,
             &retained,
+            &outbox_signals,
             &inbound,
             &cfg,
             &mut frame_buf,
@@ -869,12 +896,14 @@ mod tests {
         let registry = Mutex::<CriticalSectionRawMutex, _>::new(SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new());
         let retained = Mutex::<CriticalSectionRawMutex, _>::new(RetainedStore::<MAX_RETAINED>::new());
         let inbound = Channel::<CriticalSectionRawMutex, MqttIntent, INBOUND_N>::new();
+        let outbox_signals = outbox_signals();
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
 
         block_on(connection_loop(
             &mut transport,
             &registry,
             &retained,
+            &outbox_signals,
             &inbound,
             &config(),
             &mut frame_buf,
@@ -900,22 +929,27 @@ mod tests {
             RetainedStore::<MAX_RETAINED>::new(),
         ));
 
+        let outbox_signals: &'static SessionSignals<MAX_SESSIONS> =
+            Box::leak(Box::new(outbox_signals()));
         let registry_for_thread = registry.clone();
         thread::spawn(move || loop {
             let mut guard = block_on(registry_for_thread.lock());
             if let Some(session_id) = guard.find_by_client_id("mobile-app") {
+                let publish = guard
+                    .store_publish_ref("devices/kitchen/temp", b"hello", false)
+                    .unwrap();
                 guard
                     .get_mut(session_id)
                     .unwrap()
                     .inflight_add(InflightEntry {
                         packet_id: 7,
-                        topic: String::<128>::try_from("devices/kitchen/temp").unwrap(),
-                        payload: Vec::<u8, 512>::from_slice(b"hello").unwrap(),
+                        publish,
                         qos: QoS::AtLeastOnce,
                         sent_at: Instant::now().checked_sub(Duration::from_secs(2)).unwrap(),
                         retries: 0,
                     })
                     .unwrap();
+                outbox_signals[session_id].signal(());
                 break;
             }
             drop(guard);
@@ -929,6 +963,7 @@ mod tests {
             &mut transport,
             &registry,
             &retained,
+            outbox_signals,
             &inbound,
             &cfg,
             &mut frame_buf,
@@ -956,6 +991,8 @@ mod tests {
             RetainedStore::<MAX_RETAINED>::new(),
         ));
 
+        let outbox_signals: &'static SessionSignals<MAX_SESSIONS> =
+            Box::leak(Box::new(outbox_signals()));
         let registry_for_thread = registry.clone();
         thread::spawn(move || loop {
             let mut guard = block_on(registry_for_thread.lock());
@@ -965,7 +1002,7 @@ mod tests {
                         .get_mut(session_id)
                         .unwrap()
                         .outbox
-                        .push(crate::session::state::OutboundPacket {
+                        .push_back(crate::session::state::OutboundPacket {
                             bytes: Vec::from_slice(
                                 encode_packet(&publish_packet(
                                     "test/topic",
@@ -977,6 +1014,7 @@ mod tests {
                             .unwrap(),
                         })
                         .unwrap();
+                    outbox_signals[session_id].signal(());
                     drop(guard);
                     while !transport_writer
                         .tx_log()
@@ -1001,6 +1039,7 @@ mod tests {
             &mut transport,
             &registry,
             &retained,
+            outbox_signals,
             &inbound,
             &config(),
             &mut frame_buf,

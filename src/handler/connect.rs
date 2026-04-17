@@ -581,8 +581,9 @@ mod tests {
         assert_eq!(outcome.session_id, old_session_id);
         assert!(registry.get(old_session_id).is_some());
         assert_eq!(registry.published_lwts().len(), 1);
-        assert_eq!(registry.published_lwts()[0].topic.as_str(), "house/device/status");
-        assert_eq!(registry.published_lwts()[0].payload.as_slice(), b"offline");
+        let published_lwt = registry.published_lwts().front().unwrap();
+        assert_eq!(published_lwt.topic.as_str(), "house/device/status");
+        assert_eq!(published_lwt.payload.as_slice(), b"offline");
         assert_eq!(outcome.displaced_lwt.unwrap().payload.as_slice(), b"offline");
     }
 

@@ -1,16 +1,48 @@
-use super::state::{LwtMessage, SessionId, SessionState};
-use heapless::Vec;
+use super::state::{LwtMessage, SessionId, SessionState, StoredPublishHandle};
+use heapless::{Deque, String, Vec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistryError {
     Full,
     LwtQueueFull,
+    PublishStoreFull,
+    PublishTopicTooLong,
+    PublishPayloadTooLarge,
+    PublishRefcountOverflow,
+    PublishHandleInvalid,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRegistry<const N: usize, const MAX_SUBS: usize, const MAX_INFLIGHT: usize> {
+    slots: [Option<SessionState<MAX_SUBS, MAX_INFLIGHT>>; N],
+    published_lwts: Deque<LwtMessage, N>,
+    stored_publishes: [Option<StoredPublish>; MAX_INFLIGHT],
+    next_publish_generation: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionRegistry<const N: usize, const MAX_SUBS: usize, const MAX_INFLIGHT: usize> {
-    slots: [Option<SessionState<MAX_SUBS, MAX_INFLIGHT>>; N],
-    published_lwts: Vec<LwtMessage, N>,
+pub struct StoredPublish {
+    pub topic: String<128>,
+    pub payload: Vec<u8, 512>,
+    pub retain: bool,
+    generation: u32,
+    refcount: u16,
+}
+
+impl<const N: usize, const MAX_SUBS: usize, const MAX_INFLIGHT: usize> PartialEq
+    for SessionRegistry<N, MAX_SUBS, MAX_INFLIGHT>
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.slots == other.slots
+            && self.published_lwts.iter().eq(other.published_lwts.iter())
+            && self.stored_publishes == other.stored_publishes
+            && self.next_publish_generation == other.next_publish_generation
+    }
+}
+
+impl<const N: usize, const MAX_SUBS: usize, const MAX_INFLIGHT: usize> Eq
+    for SessionRegistry<N, MAX_SUBS, MAX_INFLIGHT>
+{
 }
 
 impl<const N: usize, const MAX_SUBS: usize, const MAX_INFLIGHT: usize> Default
@@ -27,7 +59,9 @@ impl<const N: usize, const MAX_SUBS: usize, const MAX_INFLIGHT: usize>
     pub const fn new() -> Self {
         Self {
             slots: [const { None }; N],
-            published_lwts: Vec::new(),
+            published_lwts: Deque::new(),
+            stored_publishes: [const { None }; MAX_INFLIGHT],
+            next_publish_generation: 1,
         }
     }
 
@@ -52,7 +86,11 @@ impl<const N: usize, const MAX_SUBS: usize, const MAX_INFLIGHT: usize>
     }
 
     pub fn remove(&mut self, id: SessionId) -> Option<SessionState<MAX_SUBS, MAX_INFLIGHT>> {
-        self.slots.get_mut(id).and_then(Option::take)
+        let removed = self.slots.get_mut(id).and_then(Option::take)?;
+        for entry in &removed.inflight {
+            self.release_stored_publish(entry.publish);
+        }
+        Some(removed)
     }
 
     pub fn find_by_client_id(&self, client_id: &str) -> Option<SessionId> {
@@ -87,20 +125,83 @@ impl<const N: usize, const MAX_SUBS: usize, const MAX_INFLIGHT: usize>
 
     pub fn record_published_lwt(&mut self, lwt: LwtMessage) -> Result<(), RegistryError> {
         self.published_lwts
-            .push(lwt)
+            .push_back(lwt)
             .map_err(|_| RegistryError::LwtQueueFull)
     }
 
-    pub fn published_lwts(&self) -> &[LwtMessage] {
+    pub fn published_lwts(&self) -> &Deque<LwtMessage, N> {
         &self.published_lwts
     }
 
     pub fn take_published_lwt(&mut self) -> Option<LwtMessage> {
-        if self.published_lwts.is_empty() {
-            None
-        } else {
-            Some(self.published_lwts.remove(0))
+        self.published_lwts.pop_front()
+    }
+
+    pub fn store_publish_ref(
+        &mut self,
+        topic: &str,
+        payload: &[u8],
+        retain: bool,
+    ) -> Result<StoredPublishHandle, RegistryError> {
+        let Some((slot, stored)) = self
+            .stored_publishes
+            .iter_mut()
+            .enumerate()
+            .find(|(_, stored)| stored.is_none())
+        else {
+            return Err(RegistryError::PublishStoreFull);
+        };
+
+        let generation = self.next_publish_generation;
+        self.next_publish_generation = self.next_publish_generation.wrapping_add(1);
+        if self.next_publish_generation == 0 {
+            self.next_publish_generation = 1;
         }
+
+        *stored = Some(StoredPublish {
+            topic: String::<128>::try_from(topic).map_err(|_| RegistryError::PublishTopicTooLong)?,
+            payload: Vec::<u8, 512>::from_slice(payload)
+                .map_err(|_| RegistryError::PublishPayloadTooLarge)?,
+            retain,
+            generation,
+            refcount: 1,
+        });
+
+        Ok(StoredPublishHandle { slot, generation })
+    }
+
+    pub fn acquire_stored_publish(
+        &mut self,
+        handle: StoredPublishHandle,
+    ) -> Result<(), RegistryError> {
+        let Some(stored) = self.stored_publish_mut(handle) else {
+            return Err(RegistryError::PublishHandleInvalid);
+        };
+        stored.refcount = stored
+            .refcount
+            .checked_add(1)
+            .ok_or(RegistryError::PublishRefcountOverflow)?;
+        Ok(())
+    }
+
+    pub fn release_stored_publish(&mut self, handle: StoredPublishHandle) {
+        let Some(stored) = self.stored_publish_mut(handle) else {
+            return;
+        };
+        stored.refcount = stored.refcount.saturating_sub(1);
+        if stored.refcount == 0 {
+            self.stored_publishes[handle.slot] = None;
+        }
+    }
+
+    pub fn stored_publish(&self, handle: StoredPublishHandle) -> Option<&StoredPublish> {
+        let stored = self.stored_publishes.get(handle.slot)?.as_ref()?;
+        (stored.generation == handle.generation).then_some(stored)
+    }
+
+    fn stored_publish_mut(&mut self, handle: StoredPublishHandle) -> Option<&mut StoredPublish> {
+        let stored = self.stored_publishes.get_mut(handle.slot)?.as_mut()?;
+        (stored.generation == handle.generation).then_some(stored)
     }
 }
 
@@ -208,8 +309,8 @@ mod tests {
         let mut registry = SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
         let _ = registry.insert(session("client-0", 30)).unwrap();
 
-        assert_eq!(registry.remove(MAX_SESSIONS + 1), None);
-        assert_eq!(registry.remove(4), None);
+        assert!(registry.remove(MAX_SESSIONS + 1).is_none());
+        assert!(registry.remove(4).is_none());
     }
 
     #[test]

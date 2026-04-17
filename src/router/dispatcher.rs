@@ -1,4 +1,5 @@
 use crate::router::topic_matches;
+use crate::qos::max_qos;
 use crate::session::registry::SessionRegistry;
 use crate::session::state::SessionId;
 use heapless::Vec;
@@ -65,22 +66,6 @@ pub fn find_all_subscribers<
     }
 
     subscribers
-}
-
-fn max_qos(lhs: QoS, rhs: QoS) -> QoS {
-    if qos_rank(lhs) >= qos_rank(rhs) {
-        lhs
-    } else {
-        rhs
-    }
-}
-
-const fn qos_rank(qos: QoS) -> u8 {
-    match qos {
-        QoS::AtMostOnce => 0,
-        QoS::AtLeastOnce => 1,
-        QoS::ExactlyOnce => 2,
-    }
 }
 
 #[cfg(test)]

@@ -1,16 +1,21 @@
 use crate::codec::frame::write_packet;
 use crate::config::GATOMQTT_CONFIG;
 use crate::handler::command::{CommandHandler, MqttIntent};
+use crate::qos::min_qos;
 use crate::router::{find_all_subscribers, find_subscribers, RetainedStore};
-use crate::topics::is_command_topic;
+use crate::session::notify::{signal_session, SessionSignals};
 use crate::session::registry::SessionRegistry;
-use crate::session::state::{InflightEntry, OutboundPacket, SessionId, SessionState, MAX_OUTBOUND_FRAME_SIZE};
+use crate::session::state::{
+    InflightEntry, OutboundPacket, SessionId, SessionState, StoredPublishHandle,
+    MAX_OUTBOUND_FRAME_SIZE,
+};
+use crate::topics::is_command_topic;
 use crate::transport::Transport;
+#[cfg(test)]
+use core::sync::atomic::{AtomicUsize, Ordering};
 use embassy_time::{Duration, Instant};
 use heapless::{String, Vec};
 use mqttrs::{Pid, Publish, QosPid, QoS};
-#[cfg(test)]
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MqttPublish {
@@ -36,6 +41,7 @@ pub enum PublishError {
 pub enum RetryDisconnect<E> {
     MaxRetriesExceeded { packet_id: u16, retries: u8 },
     InvalidPacketId(u16),
+    MissingStoredPublish { packet_id: u16 },
     Write(crate::codec::frame::WriteError<E>),
 }
 
@@ -49,6 +55,7 @@ pub async fn handle_publish<
     sender_id: SessionId,
     registry: &mut SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>,
     retained: &mut RetainedStore<MAX_RETAINED>,
+    outbox_signals: &SessionSignals<MAX_SESSIONS>,
     command_handler: &H,
     packet: &Publish<'_>,
 ) -> Result<(), PublishError> {
@@ -56,6 +63,7 @@ pub async fn handle_publish<
         sender_id,
         registry,
         retained,
+        outbox_signals,
         command_handler,
         packet,
         Instant::now(),
@@ -75,6 +83,7 @@ async fn handle_publish_at<
     sender_id: SessionId,
     registry: &mut SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>,
     retained: &mut RetainedStore<MAX_RETAINED>,
+    outbox_signals: &SessionSignals<MAX_SESSIONS>,
     command_handler: &H,
     packet: &Publish<'_>,
     now: Instant,
@@ -108,6 +117,7 @@ async fn handle_publish_at<
             .map_err(map_retained_error)?;
     }
 
+    let mut shared_publish = None;
     let subscribers = find_subscribers(registry, packet.topic_name, sender_id);
     for (session_id, subscriber_qos) in subscribers {
         let effective_qos = min_qos(incoming_qos, subscriber_qos);
@@ -126,7 +136,7 @@ async fn handle_publish_at<
 
         let bytes = encode_publish(packet.topic_name, packet.payload, effective_qos, packet.retain, packet_id)?;
 
-        if session.outbox.push(OutboundPacket { bytes }).is_err() {
+        if session.outbox.push_back(OutboundPacket { bytes }).is_err() {
             session.outbox_drops = session.outbox_drops.saturating_add(1);
             if session.outbox_drops >= max_outbox_drops {
                 session.quarantined = true;
@@ -137,6 +147,7 @@ async fn handle_publish_at<
             // Outbox full: no delivery, so don't create an inflight entry either.
             continue;
         }
+        signal_session(outbox_signals, session_id);
 
         // For QoS1: record the delivery in the receiver's inflight so that:
         //   a) the connection loop can retry on timeout, and
@@ -145,18 +156,37 @@ async fn handle_publish_at<
         // happens via the outbox, but there will be no retry nor PUBACK matching
         // for that one message.
         if effective_qos == QoS::AtLeastOnce {
-            if let (Ok(topic), Ok(payload)) = (
-                String::<128>::try_from(packet.topic_name),
-                Vec::<u8, 512>::from_slice(packet.payload),
-            ) {
-                let _ = session.inflight_add(InflightEntry {
-                    packet_id,
-                    topic,
-                    payload,
-                    qos: QoS::AtLeastOnce,
-                    sent_at: now,
-                    retries: 0,
-                });
+            if registry
+                .get(session_id)
+                .map(|session| session.inflight.len() < MAX_INFLIGHT)
+                .unwrap_or(false)
+            {
+                if let Some(handle) = acquire_shared_publish(
+                    registry,
+                    &mut shared_publish,
+                    packet.topic_name,
+                    packet.payload,
+                    packet.retain,
+                ) {
+                    let added = registry
+                        .get_mut(session_id)
+                        .map(|session| {
+                            session
+                                .inflight_add(InflightEntry {
+                                    packet_id,
+                                    publish: handle,
+                                    qos: QoS::AtLeastOnce,
+                                    sent_at: now,
+                                    retries: 0,
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+
+                    if !added {
+                        registry.release_stored_publish(handle);
+                    }
+                }
             }
         }
     }
@@ -185,26 +215,32 @@ async fn handle_publish_at<
 pub fn handle_puback<const MAX_SUBS: usize, const MAX_INFLIGHT: usize>(
     session: &mut SessionState<MAX_SUBS, MAX_INFLIGHT>,
     packet_id: u16,
-) {
-    if !session.inflight_ack(packet_id) {
+) -> Option<StoredPublishHandle> {
+    let Some(entry) = session.inflight_remove(packet_id) else {
         log_unknown_puback(packet_id);
-    }
+        return None;
+    };
+
+    Some(entry.publish)
 }
 
 pub async fn process_inflight_retries<
     T: Transport,
+    const MAX_SESSIONS: usize,
     const MAX_SUBS: usize,
     const MAX_INFLIGHT: usize,
     const MAX_PACKET_SIZE: usize,
 >(
-    session: &mut SessionState<MAX_SUBS, MAX_INFLIGHT>,
+    session_id: SessionId,
+    registry: &mut SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>,
     transport: &mut T,
     frame_buf: &mut [u8; MAX_PACKET_SIZE],
     retry_ms: u32,
     max_retries: u8,
 ) -> Result<(), RetryDisconnect<T::Error>> {
     process_inflight_retries_at(
-        session,
+        session_id,
+        registry,
         transport,
         frame_buf,
         retry_ms,
@@ -234,6 +270,7 @@ pub fn process_outbound_publish<
 >(
     registry: &mut SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>,
     retained: &mut RetainedStore<MAX_RETAINED>,
+    outbox_signals: &SessionSignals<MAX_SESSIONS>,
     publish: &MqttPublish,
 ) -> Result<(), PublishError> {
     if publish.retain {
@@ -243,6 +280,7 @@ pub fn process_outbound_publish<
     }
 
     let now = Instant::now();
+    let mut shared_publish = None;
     let subscribers = find_all_subscribers(registry, publish.topic.as_str());
     for (session_id, subscriber_qos) in subscribers {
         let effective_qos = min_qos(publish.qos, subscriber_qos);
@@ -265,7 +303,7 @@ pub fn process_outbound_publish<
             packet_id,
         )?;
 
-        if session.outbox.push(OutboundPacket { bytes }).is_err() {
+        if session.outbox.push_back(OutboundPacket { bytes }).is_err() {
             session.outbox_drops = session.outbox_drops.saturating_add(1);
             if session.outbox_drops >= GATOMQTT_CONFIG.max_outbox_drops {
                 session.quarantined = true;
@@ -275,20 +313,40 @@ pub fn process_outbound_publish<
             }
             continue;
         }
+        signal_session(outbox_signals, session_id);
 
         if effective_qos == QoS::AtLeastOnce {
-            if let (Ok(topic), Ok(payload)) = (
-                String::<128>::try_from(publish.topic.as_str()),
-                Vec::<u8, 512>::from_slice(publish.payload.as_slice()),
-            ) {
-                let _ = session.inflight_add(InflightEntry {
-                    packet_id,
-                    topic,
-                    payload,
-                    qos: QoS::AtLeastOnce,
-                    sent_at: now,
-                    retries: 0,
-                });
+            if registry
+                .get(session_id)
+                .map(|session| session.inflight.len() < MAX_INFLIGHT)
+                .unwrap_or(false)
+            {
+                if let Some(handle) = acquire_shared_publish(
+                    registry,
+                    &mut shared_publish,
+                    publish.topic.as_str(),
+                    publish.payload.as_slice(),
+                    publish.retain,
+                ) {
+                    let added = registry
+                        .get_mut(session_id)
+                        .map(|session| {
+                            session
+                                .inflight_add(InflightEntry {
+                                    packet_id,
+                                    publish: handle,
+                                    qos: QoS::AtLeastOnce,
+                                    sent_at: now,
+                                    retries: 0,
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false);
+
+                    if !added {
+                        registry.release_stored_publish(handle);
+                    }
+                }
             }
         }
     }
@@ -327,21 +385,27 @@ fn encode_publish(
         .map_err(|_| PublishError::PayloadTooLarge)
 }
 
-
-fn min_qos(lhs: QoS, rhs: QoS) -> QoS {
-    if qos_rank(lhs) <= qos_rank(rhs) {
-        lhs
-    } else {
-        rhs
+fn acquire_shared_publish<
+    const MAX_SESSIONS: usize,
+    const MAX_SUBS: usize,
+    const MAX_INFLIGHT: usize,
+>(
+    registry: &mut SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>,
+    shared_publish: &mut Option<StoredPublishHandle>,
+    topic: &str,
+    payload: &[u8],
+    retain: bool,
+) -> Option<StoredPublishHandle> {
+    if let Some(handle) = *shared_publish {
+        if registry.acquire_stored_publish(handle).is_ok() {
+            return Some(handle);
+        }
+        return None;
     }
-}
 
-const fn qos_rank(qos: QoS) -> u8 {
-    match qos {
-        QoS::AtMostOnce => 0,
-        QoS::AtLeastOnce => 1,
-        QoS::ExactlyOnce => 2,
-    }
+    let handle = registry.store_publish_ref(topic, payload, retain).ok()?;
+    *shared_publish = Some(handle);
+    Some(handle)
 }
 
 fn map_retained_error(error: crate::router::RetainedError) -> PublishError {
@@ -354,11 +418,13 @@ fn map_retained_error(error: crate::router::RetainedError) -> PublishError {
 
 async fn process_inflight_retries_at<
     T: Transport,
+    const MAX_SESSIONS: usize,
     const MAX_SUBS: usize,
     const MAX_INFLIGHT: usize,
     const MAX_PACKET_SIZE: usize,
 >(
-    session: &mut SessionState<MAX_SUBS, MAX_INFLIGHT>,
+    session_id: SessionId,
+    registry: &mut SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>,
     transport: &mut T,
     frame_buf: &mut [u8; MAX_PACKET_SIZE],
     retry_ms: u32,
@@ -366,21 +432,34 @@ async fn process_inflight_retries_at<
     now: Instant,
 ) -> Result<(), RetryDisconnect<T::Error>> {
     let timeout = Duration::from_millis(retry_ms as u64);
+    let inflight_len = registry
+        .get(session_id)
+        .map(|session| session.inflight.len())
+        .unwrap_or(0);
 
-    for index in 0..session.inflight.len() {
-        let expired = {
-            let entry = &session.inflight[index];
+    for index in 0..inflight_len {
+        let Some((packet_id, publish)) = ({
+            let Some(session) = registry.get(session_id) else {
+                return Ok(());
+            };
+            let Some(entry) = session.inflight.get(index) else {
+                continue;
+            };
             now.checked_duration_since(entry.sent_at)
                 .map(|elapsed| elapsed >= timeout)
                 .unwrap_or(false)
+                .then_some((entry.packet_id, entry.publish))
+        }) else {
+            continue;
         };
 
-        if !expired {
-            continue;
-        }
-
-        let (packet_id, topic, payload, retries) = {
-            let entry = &mut session.inflight[index];
+        let retries = {
+            let Some(session) = registry.get_mut(session_id) else {
+                return Ok(());
+            };
+            let Some(entry) = session.inflight.get_mut(index) else {
+                continue;
+            };
             entry.retries = entry.retries.saturating_add(1);
             if entry.retries > max_retries {
                 return Err(RetryDisconnect::MaxRetriesExceeded {
@@ -389,19 +468,21 @@ async fn process_inflight_retries_at<
                 });
             }
 
-            (
-                entry.packet_id,
-                entry.topic.clone(),
-                entry.payload.clone(),
-                entry.retries,
-            )
+            entry.retries
+        };
+
+        let (topic, payload, retain) = {
+            let Some(stored) = registry.stored_publish(publish) else {
+                return Err(RetryDisconnect::MissingStoredPublish { packet_id });
+            };
+            (stored.topic.clone(), stored.payload.clone(), stored.retain)
         };
 
         let pid = Pid::try_from(packet_id).map_err(|_| RetryDisconnect::InvalidPacketId(packet_id))?;
         let packet = mqttrs::Packet::Publish(Publish {
             dup: true,
             qospid: QosPid::AtLeastOnce(pid),
-            retain: false,
+            retain,
             topic_name: topic.as_str(),
             payload: payload.as_slice(),
         });
@@ -410,8 +491,14 @@ async fn process_inflight_retries_at<
             .await
             .map_err(RetryDisconnect::Write)?;
 
-        session.inflight[index].sent_at = now;
-        session.inflight[index].retries = retries;
+        if let Some(entry) = registry
+            .get_mut(session_id)
+            .and_then(|session| session.inflight.get_mut(index))
+            .filter(|entry| entry.packet_id == packet_id)
+        {
+            entry.sent_at = now;
+            entry.retries = retries;
+        }
     }
 
     Ok(())
@@ -464,20 +551,26 @@ mod tests {
     use crate::handler::command::mock::MockCommandHandler;
     use core::sync::atomic::Ordering;
     use crate::router::RetainedStore;
+    use crate::session::notify::{new_session_signals, SessionSignals};
     use crate::session::rate_limit::TokenBucket;
     use crate::session::registry::SessionRegistry;
-    use crate::session::state::{InflightEntry, SessionState, Subscription};
+    use crate::session::state::{InflightEntry, SessionState, StoredPublishHandle, Subscription};
     use crate::transport::mock::MockTransport;
     use embassy_time::Instant;
     use heapless::Vec;
     use heapless::String;
     use mqttrs::{Packet, Publish, QosPid, QoS};
+    use std::boxed::Box;
 
     const MAX_SESSIONS: usize = 8;
     const MAX_SUBS: usize = 8;
     const MAX_INFLIGHT: usize = 4;
     const MAX_RETAINED: usize = 64;
     const MAX_PACKET_SIZE: usize = 512;
+
+    fn outbox_signals() -> &'static SessionSignals<MAX_SESSIONS> {
+        Box::leak(Box::new(new_session_signals()))
+    }
 
     fn session(client_id: &str, subs: &[(&str, QoS)]) -> SessionState<MAX_SUBS, MAX_INFLIGHT> {
         let mut session = SessionState::new(String::<64>::try_from(client_id).unwrap(), 60);
@@ -496,12 +589,42 @@ mod tests {
     fn inflight_entry(packet_id: u16, sent_at: Instant, retries: u8) -> InflightEntry {
         InflightEntry {
             packet_id,
-            payload: Vec::<u8, 512>::from_slice(b"hello").unwrap(),
-            topic: String::<128>::try_from("devices/kitchen/temp").unwrap(),
+            publish: fake_publish_handle(),
             qos: QoS::AtLeastOnce,
             sent_at,
             retries,
         }
+    }
+
+    fn fake_publish_handle() -> StoredPublishHandle {
+        StoredPublishHandle {
+            slot: 0,
+            generation: 1,
+        }
+    }
+
+    fn registry_with_inflight(
+        packet_id: u16,
+        sent_at: Instant,
+        retries: u8,
+    ) -> (SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>, usize) {
+        let mut registry = SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
+        let session_id = registry.insert(session("a", &[])).unwrap();
+        let publish = registry
+            .store_publish_ref("devices/kitchen/temp", b"hello", false)
+            .unwrap();
+        registry
+            .get_mut(session_id)
+            .unwrap()
+            .inflight_add(InflightEntry {
+                packet_id,
+                publish,
+                qos: QoS::AtLeastOnce,
+                sent_at,
+                retries,
+            })
+            .unwrap();
+        (registry, session_id)
     }
 
     fn publish<'a>(topic: &'a str, payload: &'a [u8], retain: bool) -> Publish<'a> {
@@ -551,6 +674,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("test/topic", b"hello", false),
             )
@@ -558,7 +682,7 @@ mod tests {
         })
         .unwrap();
 
-        let bytes = &registry.get(receiver_id).unwrap().outbox[0].bytes;
+        let bytes = &registry.get(receiver_id).unwrap().outbox.front().unwrap().bytes;
         let routed = decode_publish(bytes.as_slice());
         assert_eq!(routed.topic_name, "test/topic");
         assert_eq!(routed.payload, b"hello");
@@ -582,6 +706,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("test/topic", b"hello", false),
             )
@@ -605,6 +730,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("test/topic", b"hello", false),
             )
@@ -627,6 +753,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("test/topic", b"one", true),
             )
@@ -638,6 +765,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("test/topic", b"two", true),
             )
@@ -664,6 +792,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("test/topic", b"", true),
             )
@@ -686,6 +815,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("test/topic", b"one", false),
             )
@@ -708,6 +838,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("sb/house1/device/relay-1/set", b"on", false),
             )
@@ -734,6 +865,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("sb/house1/device/relay-1/state", b"on", false),
             )
@@ -757,6 +889,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("sb/house1/device/relay-1/set", b"on", false),
             )
@@ -780,6 +913,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish_qos1("sb/house1/device/relay-1/set", b"on"),
             )
@@ -806,6 +940,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("test/topic", b"hello", false),
                 Instant::from_secs(0),
@@ -837,7 +972,8 @@ mod tests {
                     sender_id,
                     &mut registry,
                     &mut retained,
-                    &handler,
+                    outbox_signals(),
+                &handler,
                     &publish("test/topic", b"hello", false),
                     Instant::from_secs(0),
                     50,
@@ -853,6 +989,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("test/topic", b"hello", false),
                 Instant::from_secs(0),
@@ -886,6 +1023,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish_qos1("test/topic", b"hello"),
                 Instant::from_secs(0),
@@ -917,6 +1055,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("test/topic", b"hello", false),
                 Instant::from_secs(0),
@@ -941,7 +1080,7 @@ mod tests {
             .inflight_add(inflight_entry(5, Instant::from_millis(110), 0))
             .unwrap();
 
-        handle_puback(&mut session, 3);
+        assert_eq!(handle_puback(&mut session, 3), Some(fake_publish_handle()));
 
         assert_eq!(session.inflight.len(), 1);
         assert_eq!(session.inflight[0].packet_id, 5);
@@ -952,7 +1091,7 @@ mod tests {
         let mut session = session("a", &[]);
         reset_unknown_puback_warnings();
 
-        handle_puback(&mut session, 999);
+        assert_eq!(handle_puback(&mut session, 999), None);
 
         assert_eq!(UNKNOWN_PUBACK_WARNINGS.load(Ordering::Relaxed), 1);
         assert!(session.inflight.is_empty());
@@ -960,16 +1099,15 @@ mod tests {
 
     #[test]
     fn expired_qos1_entry_is_retried_with_dup_bit_set() {
-        let mut session = session("a", &[]);
-        session
-            .inflight_add(inflight_entry(7, Instant::from_millis(100), 0))
-            .unwrap();
+        let (mut registry, session_id) =
+            registry_with_inflight(7, Instant::from_millis(100), 0);
         let mut transport = MockTransport::new();
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
 
         pollster_block_on(async {
             process_inflight_retries_at(
-                &mut session,
+                session_id,
+                &mut registry,
                 &mut transport,
                 &mut frame_buf,
                 50,
@@ -980,6 +1118,7 @@ mod tests {
         })
         .unwrap();
 
+        let session = registry.get(session_id).unwrap();
         assert_eq!(session.inflight[0].retries, 1);
         assert_eq!(session.inflight[0].sent_at, Instant::from_millis(200));
         assert_eq!(transport.tx_log.len(), 1);
@@ -992,16 +1131,15 @@ mod tests {
 
     #[test]
     fn expired_entry_past_max_retries_requests_disconnect() {
-        let mut session = session("a", &[]);
-        session
-            .inflight_add(inflight_entry(7, Instant::from_millis(100), 3))
-            .unwrap();
+        let (mut registry, session_id) =
+            registry_with_inflight(7, Instant::from_millis(100), 3);
         let mut transport = MockTransport::new();
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
 
         let err = pollster_block_on(async {
             process_inflight_retries_at(
-                &mut session,
+                session_id,
+                &mut registry,
                 &mut transport,
                 &mut frame_buf,
                 50,
@@ -1024,16 +1162,15 @@ mod tests {
 
     #[test]
     fn non_expired_entry_is_not_retried() {
-        let mut session = session("a", &[]);
-        session
-            .inflight_add(inflight_entry(7, Instant::from_millis(180), 0))
-            .unwrap();
+        let (mut registry, session_id) =
+            registry_with_inflight(7, Instant::from_millis(180), 0);
         let mut transport = MockTransport::new();
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
 
         pollster_block_on(async {
             process_inflight_retries_at(
-                &mut session,
+                session_id,
+                &mut registry,
                 &mut transport,
                 &mut frame_buf,
                 50,
@@ -1044,7 +1181,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(session.inflight[0].retries, 0);
+        assert_eq!(registry.get(session_id).unwrap().inflight[0].retries, 0);
         assert!(transport.tx_log.is_empty());
     }
 
@@ -1065,7 +1202,7 @@ mod tests {
             retain: false,
         };
 
-        process_outbound_publish(&mut registry, &mut retained, &publish).unwrap();
+        process_outbound_publish(&mut registry, &mut retained, outbox_signals(), &publish).unwrap();
 
         assert_eq!(registry.get(sub_a).unwrap().outbox.len(), 1);
         assert_eq!(registry.get(sub_b).unwrap().outbox.len(), 1);
@@ -1087,7 +1224,7 @@ mod tests {
             retain: false,
         };
 
-        process_outbound_publish(&mut registry, &mut retained, &publish).unwrap();
+        process_outbound_publish(&mut registry, &mut retained, outbox_signals(), &publish).unwrap();
 
         assert_eq!(registry.get(only_id).unwrap().outbox.len(), 1);
     }
@@ -1103,7 +1240,7 @@ mod tests {
             retain: true,
         };
 
-        process_outbound_publish(&mut registry, &mut retained, &publish).unwrap();
+        process_outbound_publish(&mut registry, &mut retained, outbox_signals(), &publish).unwrap();
 
         assert_eq!(retained.len(), 1);
         let matches: std::vec::Vec<_> = retained.matching("devices/kitchen/temp").collect();
@@ -1121,7 +1258,7 @@ mod tests {
             retain: false,
         };
 
-        assert!(process_outbound_publish(&mut registry, &mut retained, &publish).is_ok());
+        assert!(process_outbound_publish(&mut registry, &mut retained, outbox_signals(), &publish).is_ok());
     }
 
     #[test]
@@ -1145,7 +1282,7 @@ mod tests {
                 .get_mut(slow_sub)
                 .unwrap()
                 .outbox
-                .push(OutboundPacket { bytes: dummy_bytes.clone() })
+                .push_back(OutboundPacket { bytes: dummy_bytes.clone() })
                 .unwrap();
         }
 
@@ -1159,7 +1296,8 @@ mod tests {
                     sender_id,
                     &mut registry,
                     &mut retained,
-                    &handler,
+                    outbox_signals(),
+                &handler,
                     &publish("test/topic", b"x", false),
                     Instant::from_secs(0),
                     u8::MAX,       // no rate limit
@@ -1178,6 +1316,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("test/topic", b"x", false),
                 Instant::from_secs(0),
@@ -1230,7 +1369,7 @@ mod tests {
                 .get_mut(sub_a)
                 .unwrap()
                 .outbox
-                .push(OutboundPacket { bytes: dummy_bytes.clone() })
+                .push_back(OutboundPacket { bytes: dummy_bytes.clone() })
                 .unwrap();
         }
         assert_eq!(registry.get(sub_a).unwrap().outbox.len(), MAX_OUTBOX_DEPTH);
@@ -1244,6 +1383,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("test/topic", b"hello", false),
             )
@@ -1311,6 +1451,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish_qos1("test/topic", b"hello"),
             )
@@ -1320,8 +1461,8 @@ mod tests {
 
         // Each receiver session has its own independent packet-id counter.
         // Fresh sessions both start at 1 for their first outbound QoS1 message.
-        let bytes_a = &registry.get(sub_a).unwrap().outbox[0].bytes;
-        let bytes_b = &registry.get(sub_b).unwrap().outbox[0].bytes;
+        let bytes_a = &registry.get(sub_a).unwrap().outbox.front().unwrap().bytes;
+        let bytes_b = &registry.get(sub_b).unwrap().outbox.front().unwrap().bytes;
         let pub_a = decode_publish(bytes_a.as_slice());
         let pub_b = decode_publish(bytes_b.as_slice());
 
@@ -1355,6 +1496,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish_qos1("test/topic", b"hello"),
             )
@@ -1366,14 +1508,15 @@ mod tests {
         assert_eq!(sub.inflight.len(), 1, "exactly one inflight entry expected");
 
         let entry = &sub.inflight[0];
-        assert_eq!(entry.topic.as_str(), "test/topic");
-        assert_eq!(entry.payload.as_slice(), b"hello");
+        let stored = registry.stored_publish(entry.publish).unwrap();
+        assert_eq!(stored.topic.as_str(), "test/topic");
+        assert_eq!(stored.payload.as_slice(), b"hello");
         assert_eq!(entry.qos, QoS::AtLeastOnce);
         assert_eq!(entry.retries, 0);
 
         // The packet-id in the inflight entry must match the one encoded in the
         // outbox bytes — this is what links PUBACK back to the inflight tracking.
-        let bytes = &sub.outbox[0].bytes;
+        let bytes = &sub.outbox.front().unwrap().bytes;
         let encoded = decode_publish(bytes.as_slice());
         let pid_in_packet = match encoded.qospid {
             QosPid::AtLeastOnce(pid) => pid.get(),
@@ -1381,6 +1524,61 @@ mod tests {
         };
         assert_eq!(entry.packet_id, pid_in_packet,
             "inflight packet_id must match the id encoded in the outbox bytes");
+    }
+
+    #[test]
+    fn qos1_fanout_shares_stored_publish_until_all_pubacks() {
+        let mut registry = SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
+        let sender_id = registry.insert(session("sender", &[])).unwrap();
+        let sub_a = registry
+            .insert(session("sub-a", &[("test/topic", QoS::AtLeastOnce)]))
+            .unwrap();
+        let sub_b = registry
+            .insert(session("sub-b", &[("test/topic", QoS::AtLeastOnce)]))
+            .unwrap();
+        let mut retained = RetainedStore::<MAX_RETAINED>::new();
+        let handler = MockCommandHandler::new();
+
+        pollster_block_on(async {
+            handle_publish(
+                sender_id,
+                &mut registry,
+                &mut retained,
+                outbox_signals(),
+                &handler,
+                &publish_qos1("test/topic", b"hello"),
+            )
+            .await
+        })
+        .unwrap();
+
+        let publish_a = registry.get(sub_a).unwrap().inflight[0].publish;
+        let publish_b = registry.get(sub_b).unwrap().inflight[0].publish;
+        assert_eq!(publish_a, publish_b, "fan-out must share one stored publish");
+        assert!(registry.stored_publish(publish_a).is_some());
+
+        let packet_a = registry.get(sub_a).unwrap().inflight[0].packet_id;
+        let packet_b = registry.get(sub_b).unwrap().inflight[0].packet_id;
+
+        let released_a = {
+            let sub_session = registry.get_mut(sub_a).unwrap();
+            handle_puback(sub_session, packet_a).unwrap()
+        };
+        registry.release_stored_publish(released_a);
+        assert!(
+            registry.stored_publish(publish_a).is_some(),
+            "stored publish must stay alive while another subscriber is inflight"
+        );
+
+        let released_b = {
+            let sub_session = registry.get_mut(sub_b).unwrap();
+            handle_puback(sub_session, packet_b).unwrap()
+        };
+        registry.release_stored_publish(released_b);
+        assert!(
+            registry.stored_publish(publish_a).is_none(),
+            "stored publish must be freed after the final PUBACK"
+        );
     }
 
     #[test]
@@ -1400,6 +1598,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish_qos1("test/topic", b"hello"),
             )
@@ -1410,12 +1609,19 @@ mod tests {
         let packet_id = registry.get(sub_id).unwrap().inflight[0].packet_id;
 
         // Simulate the receiver sending PUBACK.
-        let sub_session = registry.get_mut(sub_id).unwrap();
-        handle_puback(sub_session, packet_id);
+        let publish = {
+            let sub_session = registry.get_mut(sub_id).unwrap();
+            handle_puback(sub_session, packet_id).unwrap()
+        };
+        registry.release_stored_publish(publish);
 
         assert!(
             registry.get(sub_id).unwrap().inflight.is_empty(),
             "inflight must be cleared after PUBACK"
+        );
+        assert!(
+            registry.stored_publish(publish).is_none(),
+            "stored publish must be released after the final PUBACK"
         );
     }
 
@@ -1435,6 +1641,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish("test/topic", b"hello", false),
             )
@@ -1463,6 +1670,7 @@ mod tests {
                 sender_id,
                 &mut registry,
                 &mut retained,
+                outbox_signals(),
                 &handler,
                 &publish_qos1("test/topic", b"hello"),
             )
@@ -1475,7 +1683,7 @@ mod tests {
         assert_eq!(sub.outbox.len(), 1);
 
         // Verify the encoded packet is indeed QoS0.
-        let encoded = decode_publish(sub.outbox[0].bytes.as_slice());
+        let encoded = decode_publish(sub.outbox.front().unwrap().bytes.as_slice());
         assert_eq!(encoded.qospid.qos(), QoS::AtMostOnce);
     }
 }

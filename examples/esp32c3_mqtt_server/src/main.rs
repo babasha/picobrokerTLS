@@ -17,7 +17,6 @@ use embassy_net::{IpListenEndpoint, Stack, StackResources};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
-#[cfg(feature = "tls")]
 use embassy_sync::signal::Signal;
 use esp_alloc::heap_allocator;
 #[cfg(feature = "tls")]
@@ -134,6 +133,8 @@ static REGISTRY_MUTEX: Mutex<CriticalSectionRawMutex, Registry> =
     Mutex::new(SessionRegistry::new());
 static RETAINED_MUTEX: Mutex<CriticalSectionRawMutex, Retained> = Mutex::new(RetainedStore::new());
 static INBOUND_MUTEX: Inbound = Channel::new();
+static OUTBOX_SIGNALS: [Signal<CriticalSectionRawMutex, ()>; MAX_SESSIONS] =
+    [const { Signal::new() }; MAX_SESSIONS];
 
 #[cfg(feature = "tls")]
 struct WorkerBuffers {
@@ -304,13 +305,16 @@ async fn inbound_logger_task(inbound: &'static Inbound) {
 // Memory per idle slot:          TCP buffers (2 × 512 B, allocated at accept())
 
 #[cfg(feature = "tls")]
-async fn wait_for_worker_socket(socket_slot: &'static WorkerSocketSlot) -> TcpSocket<'static> {
+async fn wait_for_worker_socket(
+    socket_slot: &'static WorkerSocketSlot,
+    ready: &'static Signal<CriticalSectionRawMutex, ()>,
+) -> TcpSocket<'static> {
     loop {
         if let Some(socket) = socket_slot.take() {
             return socket;
         }
 
-        embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;
+        ready.wait().await;
     }
 }
 
@@ -372,9 +376,7 @@ async fn mqtt_tls_worker_body(
     ready: &'static Signal<CriticalSectionRawMutex, ()>,
 ) {
     loop {
-        ready.wait().await;
-
-        let mut socket = wait_for_worker_socket(socket_slot).await;
+        let mut socket = wait_for_worker_socket(socket_slot, ready).await;
 
         println!(
             "[TLS WORKER {}] Handling {:?}",
@@ -411,6 +413,7 @@ async fn mqtt_tls_worker_body(
             &mut transport,
             plain_registry(),
             plain_retained(),
+            plain_outbox_signals(),
             plain_inbound(),
             &config,
             frame_buf,
@@ -546,6 +549,7 @@ async fn plain_worker(stack: Stack<'static>) {
             &mut transport,
             plain_registry(),
             plain_retained(),
+            plain_outbox_signals(),
             plain_inbound(),
             &config,
             &mut frame_buf,
@@ -670,6 +674,10 @@ fn plain_registry() -> &'static Mutex<CriticalSectionRawMutex, Registry> {
 
 fn plain_retained() -> &'static Mutex<CriticalSectionRawMutex, Retained> {
     &RETAINED_MUTEX
+}
+
+fn plain_outbox_signals() -> &'static [Signal<CriticalSectionRawMutex, ()>; MAX_SESSIONS] {
+    &OUTBOX_SIGNALS
 }
 
 fn plain_inbound() -> &'static Inbound {
