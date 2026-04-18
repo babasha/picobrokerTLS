@@ -17,6 +17,8 @@ pub enum HandlerError<E> {
 
 pub type SubscribeError<E> = HandlerError<E>;
 
+pub const MAX_SUBSCRIBE_TOPICS: usize = 5;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetainedDelivery {
     pub topic: String<128>,
@@ -25,10 +27,10 @@ pub struct RetainedDelivery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedSubscribe {
+pub struct PreparedSubscribe<const MAX_TOPICS: usize, const MAX_RETAINED_DELIVERIES: usize> {
     pub pid: Pid,
-    pub return_codes: MqttrsVec<SubscribeReturnCodes, 5>,
-    pub retained_deliveries: Vec<RetainedDelivery, 16>,
+    pub return_codes: MqttrsVec<SubscribeReturnCodes, MAX_TOPICS>,
+    pub retained_deliveries: Vec<RetainedDelivery, MAX_RETAINED_DELIVERIES>,
 }
 
 impl<E> From<WriteError<E>> for HandlerError<E> {
@@ -84,9 +86,9 @@ pub fn prepare_subscribe<
     session: &mut SessionState<MAX_SUBS, MAX_INFLIGHT>,
     packet: &Subscribe,
     retained: &RetainedStore<MAX_RETAINED>,
-) -> PreparedSubscribe {
-    let mut return_codes = MqttrsVec::<SubscribeReturnCodes, 5>::new();
-    let mut new_filters = Vec::<String<128>, 5>::new();
+) -> PreparedSubscribe<MAX_SUBSCRIBE_TOPICS, MAX_RETAINED> {
+    let mut return_codes = MqttrsVec::<SubscribeReturnCodes, MAX_SUBSCRIBE_TOPICS>::new();
+    let mut new_filters = Vec::<String<128>, MAX_SUBSCRIBE_TOPICS>::new();
 
     for topic in &packet.topics {
         let (code, inserted) =
@@ -98,7 +100,7 @@ pub fn prepare_subscribe<
         }
     }
 
-    let mut retained_deliveries = Vec::<RetainedDelivery, 16>::new();
+    let mut retained_deliveries = Vec::<RetainedDelivery, MAX_RETAINED>::new();
     let mut next_pid = Pid::new();
     for filter in &new_filters {
         for retained_message in retained.matching(filter.as_str()) {
@@ -125,9 +127,10 @@ pub fn prepare_subscribe<
 pub async fn write_prepared_subscribe<
     T: Transport,
     const MAX_PACKET_SIZE: usize,
+    const MAX_RETAINED_DELIVERIES: usize,
 >(
     transport: &mut T,
-    prepared: &PreparedSubscribe,
+    prepared: &PreparedSubscribe<MAX_SUBSCRIBE_TOPICS, MAX_RETAINED_DELIVERIES>,
     frame_buf: &mut [u8; MAX_PACKET_SIZE],
 ) -> Result<(), HandlerError<T::Error>> {
     write_packet(
@@ -224,53 +227,6 @@ pub fn apply_unsubscribe<const MAX_SUBS: usize, const MAX_INFLIGHT: usize>(
     }
 }
 
-pub async fn deliver_retained<
-    T: Transport,
-    const MAX_SUBS: usize,
-    const MAX_INFLIGHT: usize,
-    const MAX_RETAINED: usize,
-    const MAX_PACKET_SIZE: usize,
->(
-    filter: &str,
-    _session: &mut SessionState<MAX_SUBS, MAX_INFLIGHT>,
-    retained: &RetainedStore<MAX_RETAINED>,
-    transport: &mut T,
-    frame_buf: &mut [u8; MAX_PACKET_SIZE],
-) -> Result<(), HandlerError<T::Error>> {
-    let mut next_pid = Pid::new();
-
-    for retained_message in retained.matching(filter) {
-        let qospid = match retained_message.qos {
-            QoS::AtMostOnce => QosPid::AtMostOnce,
-            QoS::AtLeastOnce => {
-                let pid = next_pid;
-                next_pid = next_pid + 1;
-                QosPid::AtLeastOnce(pid)
-            }
-            QoS::ExactlyOnce => {
-                let pid = next_pid;
-                next_pid = next_pid + 1;
-                QosPid::ExactlyOnce(pid)
-            }
-        };
-
-        write_packet(
-            transport,
-            &Packet::Publish(Publish {
-                dup: false,
-                qospid,
-                retain: true,
-                topic_name: retained_message.topic.as_str(),
-                payload: retained_message.payload.as_slice(),
-            }),
-            frame_buf,
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
 fn upsert_subscription<const MAX_SUBS: usize>(
     subscriptions: &mut Vec<Subscription, MAX_SUBS>,
     filter: &str,
@@ -327,7 +283,7 @@ fn is_valid_filter(filter: &str) -> bool {
 mod tests {
     use super::{
         handle_subscribe, handle_subscribe_for_session_id, handle_unsubscribe,
-        handle_unsubscribe_for_session_id, HandlerError,
+        handle_unsubscribe_for_session_id, prepare_subscribe, HandlerError,
     };
     use crate::router::collect_subscribers;
     use crate::router::RetainedStore;
@@ -736,6 +692,32 @@ mod tests {
             }
             other => panic!("expected retained publish, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn prepared_subscribe_keeps_more_than_sixteen_retained_deliveries() {
+        const MANY_RETAINED: usize = 20;
+        let mut session = SessionState::new(
+            String::<64>::try_from("mobile-app").unwrap(),
+            60,
+        );
+        let mut retained = RetainedStore::<MANY_RETAINED>::new();
+        for index in 0..MANY_RETAINED {
+            let topic = std::format!("devices/{index}/temp");
+            retained
+                .set(&topic, &[index as u8], QoS::AtMostOnce)
+                .unwrap();
+        }
+
+        let packet = subscribe_packet("devices/+/temp", QoS::AtMostOnce, 15);
+
+        let prepared = prepare_subscribe::<MAX_SUBS, MAX_INFLIGHT, MANY_RETAINED>(
+            &mut session,
+            &packet,
+            &retained,
+        );
+
+        assert_eq!(prepared.retained_deliveries.len(), MANY_RETAINED);
     }
 
     #[test]

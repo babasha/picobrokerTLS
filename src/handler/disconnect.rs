@@ -126,8 +126,8 @@ fn find_lwt_subscribers<
     registry: &SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>,
     disconnecting_client_id: &str,
     lwt: &LwtMessage,
-) -> Vec<(SessionId, QoS), 16> {
-    let mut deliveries = Vec::<(SessionId, QoS), 16>::new();
+) -> Vec<(SessionId, QoS), MAX_SESSIONS> {
+    let mut deliveries = Vec::<(SessionId, QoS), MAX_SESSIONS>::new();
 
     for (session_id, state) in registry.iter() {
         if state.client_id.as_str() == disconnecting_client_id {
@@ -403,5 +403,38 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err, DisconnectError::Broadcast(LwtBroadcastError::DeliveryFailed));
+    }
+
+    #[test]
+    fn lwt_reaches_more_than_sixteen_matching_sessions() {
+        const MANY_SESSIONS: usize = 20;
+        let mut registry = SessionRegistry::<MANY_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
+        for index in 0..MANY_SESSIONS {
+            let client_id = std::format!("dashboard-{index}");
+            registry
+                .insert(session(
+                    &client_id,
+                    &[("sb/house1/device/relay-1/state", QoS::AtMostOnce)],
+                ))
+                .unwrap();
+        }
+
+        let mut retained = RetainedStore::<MAX_RETAINED>::new();
+        let broadcaster = RecordingBroadcaster::default();
+        let mut disconnecting = session("sensor-1", &[]);
+        disconnecting.lwt = Some(lwt(false));
+
+        block_on(publish_lwt_if_needed(
+            &disconnecting,
+            &registry,
+            &mut retained,
+            &broadcaster,
+            DisconnectReason::ConnectionClosed,
+        ))
+        .unwrap();
+
+        let records = broadcaster.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].deliveries.len(), MANY_SESSIONS);
     }
 }

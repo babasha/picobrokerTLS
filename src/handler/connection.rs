@@ -13,7 +13,7 @@ use crate::handler::subscribe::{
     apply_unsubscribe, prepare_subscribe, write_prepared_subscribe,
 };
 use crate::router::RetainedStore;
-use crate::session::notify::{signal_session, SessionSignals};
+use crate::session::notify::{reset_session_signal, signal_session, SessionSignals};
 use crate::session::rate_limit::TokenBucket;
 use crate::session::registry::SessionRegistry;
 use crate::session::state::{LwtMessage, OutboundPacket, SessionId, MAX_OUTBOUND_FRAME_SIZE};
@@ -128,6 +128,8 @@ pub async fn connection_loop<
                     // regardless of whether the session was fresh or resumed.
                     session.update_activity();
                 }
+                reset_empty_session_signals(&registry, outbox_signals);
+                reset_session_signal(outbox_signals, session_id);
                 drop(registry);
 
                 if write_connack(transport, mqttrs::ConnectReturnCode::Accepted, outcome.session_present, &mut write_buf)
@@ -143,6 +145,7 @@ pub async fn connection_loop<
                 session_id
             }
             Ok(PreparedConnect::Rejected(code)) => {
+                reset_empty_session_signals(&registry, outbox_signals);
                 drop(registry);
                 let _ = write_connack(transport, code, false, &mut write_buf).await;
                 transport.close().await;
@@ -150,6 +153,7 @@ pub async fn connection_loop<
                 return;
             }
             Err(_) => {
+                reset_empty_session_signals(&registry, outbox_signals);
                 defmt::warn!("mqtt connection_loop: CONNECT rejected");
                 return;
             }
@@ -422,7 +426,7 @@ async fn cleanup_connection<
         let registry_guard = registry.lock().await;
         if let Some(session) = registry_guard.get(session_id) {
             if let Some(lwt) = session.lwt.clone() {
-                let broadcaster = RecordingLwtBroadcaster::<16>::new();
+                let broadcaster = RecordingLwtBroadcaster::<MAX_SESSIONS>::new();
                 {
                     let mut retained_guard = retained.lock().await;
                     let _ = publish_lwt_message_if_needed(
@@ -464,9 +468,25 @@ async fn cleanup_connection<
     {
         let mut registry = registry.lock().await;
         let _ = registry.remove(session_id);
+        reset_session_signal(outbox_signals, session_id);
     }
 
     transport.close().await;
+}
+
+fn reset_empty_session_signals<
+    const MAX_SESSIONS: usize,
+    const MAX_SUBS: usize,
+    const MAX_INFLIGHT: usize,
+>(
+    registry: &SessionRegistry<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>,
+    outbox_signals: &SessionSignals<MAX_SESSIONS>,
+) {
+    for session_id in 0..MAX_SESSIONS {
+        if registry.get(session_id).is_none() {
+            reset_session_signal(outbox_signals, session_id);
+        }
+    }
 }
 
 fn encode_publish_from_lwt(
@@ -492,7 +512,7 @@ fn encode_publish_from_lwt(
 
 #[cfg(test)]
 mod tests {
-    use super::connection_loop;
+    use super::{connection_loop, reset_empty_session_signals};
     use crate::config::BrokerConfig;
     use crate::handler::command::MqttIntent;
     use crate::router::RetainedStore;
@@ -692,6 +712,26 @@ mod tests {
             })
             .unwrap();
         session
+    }
+
+    #[test]
+    fn reset_empty_session_signals_keeps_active_session_notifications() {
+        let mut registry = SessionRegistry::<MAX_SESSIONS, MAX_SUBS, MAX_INFLIGHT>::new();
+        let active_id = registry
+            .insert(SessionState::new(
+                String::<64>::try_from("active").unwrap(),
+                60,
+            ))
+            .unwrap();
+        let empty_id = active_id + 1;
+        let signals = outbox_signals();
+        signals[active_id].signal(());
+        signals[empty_id].signal(());
+
+        reset_empty_session_signals(&registry, &signals);
+
+        assert!(signals[active_id].signaled());
+        assert!(!signals[empty_id].signaled());
     }
 
     #[test]

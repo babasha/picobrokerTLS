@@ -471,25 +471,23 @@ async fn process_inflight_retries_at<
             entry.retries
         };
 
-        let (topic, payload, retain) = {
+        let pid = Pid::try_from(packet_id).map_err(|_| RetryDisconnect::InvalidPacketId(packet_id))?;
+        {
             let Some(stored) = registry.stored_publish(publish) else {
                 return Err(RetryDisconnect::MissingStoredPublish { packet_id });
             };
-            (stored.topic.clone(), stored.payload.clone(), stored.retain)
-        };
+            let packet = mqttrs::Packet::Publish(Publish {
+                dup: true,
+                qospid: QosPid::AtLeastOnce(pid),
+                retain: stored.retain,
+                topic_name: stored.topic.as_str(),
+                payload: stored.payload.as_slice(),
+            });
 
-        let pid = Pid::try_from(packet_id).map_err(|_| RetryDisconnect::InvalidPacketId(packet_id))?;
-        let packet = mqttrs::Packet::Publish(Publish {
-            dup: true,
-            qospid: QosPid::AtLeastOnce(pid),
-            retain,
-            topic_name: topic.as_str(),
-            payload: payload.as_slice(),
-        });
-
-        write_packet(transport, &packet, frame_buf)
-            .await
-            .map_err(RetryDisconnect::Write)?;
+            write_packet(transport, &packet, frame_buf)
+                .await
+                .map_err(RetryDisconnect::Write)?;
+        }
 
         if let Some(entry) = registry
             .get_mut(session_id)

@@ -1,5 +1,5 @@
-use crate::router::topic_matches;
 use crate::qos::max_qos;
+use crate::router::topic_matches;
 use crate::session::registry::SessionRegistry;
 use crate::session::state::SessionId;
 use heapless::Vec;
@@ -13,8 +13,8 @@ pub fn find_subscribers<
     registry: &SessionRegistry<N, MAX_SUBS, MAX_INFLIGHT>,
     topic: &str,
     sender_id: SessionId,
-) -> Vec<(SessionId, QoS), 16> {
-    let mut subscribers = Vec::<(SessionId, QoS), 16>::new();
+) -> Vec<(SessionId, QoS), N> {
+    let mut subscribers = Vec::<(SessionId, QoS), N>::new();
 
     for (session_id, session) in registry.iter() {
         if session_id == sender_id {
@@ -46,8 +46,8 @@ pub fn find_all_subscribers<
 >(
     registry: &SessionRegistry<N, MAX_SUBS, MAX_INFLIGHT>,
     topic: &str,
-) -> Vec<(SessionId, QoS), 16> {
-    let mut subscribers = Vec::<(SessionId, QoS), 16>::new();
+) -> Vec<(SessionId, QoS), N> {
+    let mut subscribers = Vec::<(SessionId, QoS), N>::new();
 
     for (session_id, session) in registry.iter() {
         let mut matched_qos = None;
@@ -195,5 +195,22 @@ mod tests {
         let subscribers = find_all_subscribers(&registry, "devices/kitchen/temp");
 
         assert!(subscribers.is_empty());
+    }
+
+    #[test]
+    fn find_all_handles_more_than_sixteen_matching_sessions() {
+        const MANY_SESSIONS: usize = 20;
+        let mut registry = SessionRegistry::<MANY_SESSIONS, 8, 4>::new();
+
+        for index in 0..MANY_SESSIONS {
+            let client_id = std::format!("client-{index}");
+            registry
+                .insert(session(&client_id, &[("devices/+/temp", QoS::AtMostOnce)]))
+                .unwrap();
+        }
+
+        let subscribers = find_all_subscribers(&registry, "devices/kitchen/temp");
+
+        assert_eq!(subscribers.len(), MANY_SESSIONS);
     }
 }

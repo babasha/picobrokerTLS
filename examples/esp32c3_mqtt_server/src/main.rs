@@ -75,7 +75,10 @@ const HEAP_SIZE: usize = 272 * 1024;
 #[cfg(not(feature = "tls"))]
 const HEAP_SIZE: usize = 160 * 1024;
 
-const MAX_PACKET_SIZE: usize = 192;
+// Must fit the largest MQTT packet the broker will accept:
+//   5 (fixed header) + 2 + max_topic_len(128) + 2 (QoS1 PID) + max_payload_len(512) ≈ 650.
+// Rounded up for headroom; ~1.5 KB of rx/tx buffers per active worker.
+const MAX_PACKET_SIZE: usize = 768;
 #[cfg(feature = "tls")]
 const TCP_BUFFER_SIZE: usize = 256;
 #[cfg(not(feature = "tls"))]
