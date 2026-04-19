@@ -411,14 +411,13 @@ async fn mqtt_tls_worker_body(
         log_tls_heap("handshake ok");
         println!("[TLS WORKER {}] Handshake complete", slot);
 
-        let config = gatomqtt_config();
         Box::pin(connection_loop(
             &mut transport,
             plain_registry(),
             plain_retained(),
             plain_outbox_signals(),
             plain_inbound(),
-            &config,
+            &GATOMQTT_CONFIG,
             frame_buf,
         ))
         .await;
@@ -547,14 +546,13 @@ async fn plain_worker(stack: Stack<'static>) {
         let mut frame_buf = [0u8; MAX_PACKET_SIZE];
         let mut transport = TcpTransport::new(&mut socket);
 
-        let config = gatomqtt_config();
         Box::pin(connection_loop(
             &mut transport,
             plain_registry(),
             plain_retained(),
             plain_outbox_signals(),
             plain_inbound(),
-            &config,
+            &GATOMQTT_CONFIG,
             &mut frame_buf,
         ))
         .await;
@@ -661,15 +659,6 @@ async fn main(spawner: Spawner) {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-
-fn gatomqtt_config() -> gatomqtt::config::BrokerConfig {
-    let mut config = GATOMQTT_CONFIG;
-    config.max_sessions = MAX_SESSIONS;
-    config.max_subscriptions = MAX_SUBS;
-    config.max_inflight = MAX_INFLIGHT;
-    config.max_retained = MAX_RETAINED;
-    config
-}
 
 fn plain_registry() -> &'static Mutex<CriticalSectionRawMutex, Registry> {
     &REGISTRY_MUTEX

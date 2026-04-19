@@ -71,19 +71,19 @@ The broker is deliberately static and bounded.
 - command intents live in a fixed-size queue
 - no heap allocation is required in the core fast path
 
-Default values are defined in [`src/config.rs`](./src/config.rs):
+Size limits (`MAX_SESSIONS`, `MAX_SUBS`, `MAX_INFLIGHT`, `MAX_RETAINED`) are
+compile-time const-generics on `SessionRegistry` / `RetainedStore`; topic
+length (128) and payload length (512) are baked into the `heapless` types
+inside `SessionState`. Pick them in the example application.
+
+Runtime-tunable defaults live in [`src/config.rs`](./src/config.rs):
 
 | Parameter | Default |
 | --- | ---: |
-| `max_sessions` | `8` |
-| `max_subscriptions` | `32` |
-| `max_inflight` | `16` |
-| `max_retained` | `64` |
-| `max_topic_len` | `128` |
-| `max_payload_len` | `512` |
 | `rate_capacity` | `20` |
 | `rate_per_sec` | `10` |
 | `max_violations` | `50` |
+| `max_outbox_drops` | `16` |
 | `qos1_retry_ms` | `5000` |
 | `qos1_max_retries` | `3` |
 

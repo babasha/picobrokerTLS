@@ -108,18 +108,19 @@ This keeps the repo suitable both as a standalone workbench and as a library sub
 
 ## Tuning Knobs
 
-The first place to tune runtime limits is [`src/config.rs`](../src/config.rs).
+Size limits are compile-time const-generics chosen in the example binary:
 
-The most important knobs are:
+- `MAX_SESSIONS`, `MAX_SUBS`, `MAX_INFLIGHT` — parameters of `SessionRegistry`
+- `MAX_RETAINED` — parameter of `RetainedStore`
+- topic length (128) and payload length (512) are fixed by the `heapless` types
+  used inside `SessionState`
 
-- `max_sessions`
-- `max_subscriptions`
-- `max_inflight`
-- `max_retained`
-- `max_payload_len`
+Runtime-tunable knobs live in [`src/config.rs`](../src/config.rs):
+
 - `rate_capacity`
 - `rate_per_sec`
 - `max_violations`
+- `max_outbox_drops`
 - `qos1_retry_ms`
 - `qos1_max_retries`
 

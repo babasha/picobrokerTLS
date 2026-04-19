@@ -646,12 +646,6 @@ mod tests {
         BrokerConfig {
             house_token_username: "house",
             house_token_password: "secret",
-            max_sessions: MAX_SESSIONS,
-            max_subscriptions: MAX_SUBS,
-            max_inflight: MAX_INFLIGHT,
-            max_retained: MAX_RETAINED,
-            max_topic_len: 128,
-            max_payload_len: 512,
             rate_capacity: 20,
             rate_per_sec: 10,
             max_violations: 50,
