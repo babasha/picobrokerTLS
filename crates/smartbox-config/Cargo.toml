@@ -1,0 +1,11 @@
+[package]
+name = "smartbox-config"
+version = "0.1.0"
+edition = "2021"
+description = "SmartBox no_std canonical config schema and compiler"
+license = "MIT"
+
+[dependencies]
+heapless = { version = "0.8", features = ["serde"] }
+postcard = { version = "1.0", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive"] }

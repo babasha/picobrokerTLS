@@ -10,7 +10,10 @@ categories = ["network-programming", "embedded", "parser-implementations"]
 readme = "./README.md"
 
 [workspace]
-members = ["."]
+members = [
+    ".",
+    "crates/smartbox-config",
+]
 resolver = "2"
 
 [features]
