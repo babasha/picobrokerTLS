@@ -1,9 +1,10 @@
 [workspace]
 members = [
     "crates/GatoMQTT",
-    "crates/GatoPSKTLS",
     "crates/smartbox-config",
 ]
+# GatoPSKTLS lives in its own repo: https://github.com/babasha/GatoPSKTLS
+# (https://crates.io/crates/GatoPSKTLS). We pull it from crates.io now.
 exclude = [
     # Other vendored / tool crates manage their own workspaces.
     "vendor/mbedtls-rs",
