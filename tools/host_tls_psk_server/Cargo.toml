@@ -1,0 +1,18 @@
+[package]
+name = "host_tls_psk_server"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Host-side tokio TCP wrapper around embedded-tls server-mode primitives — for interop testing"
+
+[workspace]
+
+[dependencies]
+gatopsktls = { package = "GatoPSKTLS", path = "../../crates/GatoPSKTLS" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net"] }
+anyhow = "1"
+env_logger = "0.11"
+log = "0.4"
+rand = "0.8"
+hex = "0.4"
+clap = { version = "4", features = ["derive"] }

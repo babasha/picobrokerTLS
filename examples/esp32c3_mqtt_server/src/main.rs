@@ -19,8 +19,6 @@ use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use esp_alloc::heap_allocator;
-#[cfg(feature = "tls")]
-use esp_alloc::HEAP;
 use esp_backtrace as _;
 use esp_println::println;
 use gatomqtt::config::GATOMQTT_CONFIG;
@@ -28,6 +26,10 @@ use gatomqtt::handler::command::MqttIntent;
 use gatomqtt::handler::connection::connection_loop;
 use gatomqtt::router::RetainedStore;
 use gatomqtt::session::registry::SessionRegistry;
+#[cfg(feature = "tls")]
+use gatomqtt::tls::embedded_tls_psk::EmbeddedTlsPskSession;
+#[cfg(feature = "tls")]
+use gatomqtt::transport::tls::TlsTransport as GatoTlsTransport;
 #[cfg(feature = "tls")]
 use gatomqtt::transport::Transport as _;
 
@@ -38,14 +40,10 @@ mod transport;
 
 use bootstrap::RECLAIMED_RAM;
 #[cfg(feature = "tls")]
-use tls_support::mqtt_server_config;
-#[cfg(not(feature = "tls"))]
+use bootstrap::SharedTrng;
+#[cfg(feature = "tls")]
+use tls_support::psk_config;
 use transport::TcpTransport;
-#[cfg(feature = "tls")]
-use transport::{TcpTransport, TlsTransport};
-
-#[cfg(feature = "tls")]
-use mbedtls_rs::{SharedSessionConfig, Tls};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -64,31 +62,28 @@ const MQTT_PORT: u16 = 8883;
 const MQTT_PORT: u16 = 1883;
 
 #[cfg(feature = "tls")]
-const TLS_USE_HW_ACCEL: bool = false;
-#[cfg(feature = "tls")]
-const TLS_DEBUG_LEVEL: u32 = 0;
-#[cfg(feature = "tls")]
-const TLS_ENABLE_INBOUND_LOGGER: bool = false;
-
-#[cfg(feature = "tls")]
-const HEAP_SIZE: usize = 272 * 1024;
+const HEAP_SIZE: usize = 200 * 1024;
 #[cfg(not(feature = "tls"))]
 const HEAP_SIZE: usize = 160 * 1024;
 
+#[cfg(feature = "tls")]
+const TLS_ENABLE_INBOUND_LOGGER: bool = false;
+
 // Must fit the largest MQTT packet the broker will accept:
 //   5 (fixed header) + 2 + max_topic_len(128) + 2 (QoS1 PID) + max_payload_len(512) ≈ 650.
-// Rounded up for headroom; ~1.5 KB of rx/tx buffers per active worker.
+// Rounded up for headroom.
 const MAX_PACKET_SIZE: usize = 768;
 #[cfg(feature = "tls")]
-const TCP_BUFFER_SIZE: usize = 256;
+const TCP_BUFFER_SIZE: usize = 512;
 #[cfg(not(feature = "tls"))]
 const TCP_BUFFER_SIZE: usize = 512;
 
+/// Buffer size for the embedded-tls session (rx/tx record buffers + plaintext
+/// buffer, three of these per session = ~12 KB plus the session struct).
+#[cfg(feature = "tls")]
+const TLS_SESSION_BUF: usize = 4096;
+
 /// Maximum concurrent TLS connections.
-///
-/// Each spawned worker holds 2×512 B TCP buffers on the heap while waiting on
-/// accept(), so idle cost = MAX_TLS_CONNECTIONS × 1 KB.  TLS sessions (≈13 KB
-/// each) are allocated only while a connection is active.
 #[cfg(feature = "tls")]
 const MAX_TLS_CONNECTIONS: usize = 4;
 
@@ -231,15 +226,10 @@ static WORKER_BUSY: [Mutex<CriticalSectionRawMutex, bool>; MAX_TLS_CONNECTIONS] 
 static WORKER_SIGNALS: [Signal<CriticalSectionRawMutex, ()>; MAX_TLS_CONNECTIONS] =
     [const { Signal::new() }; MAX_TLS_CONNECTIONS];
 
-// ── dynamic TCP socket buffers ─────────────────────────────────────────────────
+// ── dynamic TCP socket buffers (plain mode only) ───────────────────────────────
 
 #[cfg(not(feature = "tls"))]
 /// Heap-allocated TCP socket rx/tx buffers that expose `'static` references.
-///
-/// # Safety invariant
-/// Any `TcpSocket` created from these buffers **must** be dropped before this
-/// struct is dropped. The natural Rust LIFO drop order guarantees this when
-/// `OwnedSocketBuffers` is declared before the `TcpSocket` in the same scope.
 struct OwnedSocketBuffers {
     rx: NonNull<[u8]>,
     tx: NonNull<[u8]>,
@@ -247,8 +237,6 @@ struct OwnedSocketBuffers {
 
 #[cfg(not(feature = "tls"))]
 impl OwnedSocketBuffers {
-    /// Allocates rx and tx buffers from the heap.
-    /// Returns `None` if the heap is exhausted.
     fn new() -> Option<Self> {
         let rx = alloc::vec![0u8; TCP_BUFFER_SIZE].into_boxed_slice();
         let tx = alloc::vec![0u8; TCP_BUFFER_SIZE].into_boxed_slice();
@@ -258,14 +246,7 @@ impl OwnedSocketBuffers {
         })
     }
 
-    /// Returns `'static` mutable slices into the heap buffers.
-    ///
-    /// # Safety
-    /// The `TcpSocket` that borrows these slices must be dropped before
-    /// `self` is dropped. Declare `self` before the socket so Rust's LIFO
-    /// drop order guarantees this automatically.
     unsafe fn as_static_mut(&mut self) -> (&'static mut [u8], &'static mut [u8]) {
-        // SAFETY: pointers are valid heap allocations, uniquely owned here.
         unsafe { (&mut *self.rx.as_ptr(), &mut *self.tx.as_ptr()) }
     }
 }
@@ -273,8 +254,6 @@ impl OwnedSocketBuffers {
 #[cfg(not(feature = "tls"))]
 impl Drop for OwnedSocketBuffers {
     fn drop(&mut self) {
-        // SAFETY: pointers were created by Box::into_raw in new() and are
-        // not used after TcpSocket is dropped (invariant upheld by callers).
         unsafe {
             drop(Box::from_raw(self.rx.as_ptr()));
             drop(Box::from_raw(self.tx.as_ptr()));
@@ -297,15 +276,6 @@ async fn inbound_logger_task(inbound: &'static Inbound) {
 }
 
 // ── TLS worker ────────────────────────────────────────────────────────────────
-//
-// Each task instance handles one connection at a time, then loops back to
-// accept the next one.  pool_size controls how many connections can be served
-// concurrently; the embassy executor pre-allocates that many task-future slots
-// (~300 B each), but TCP buffers and TLS sessions are heap-allocated only
-// while a connection is active.
-//
-// Memory per active connection:  TCP buffers (2 × 512 B) + TLS session (~13 KB)
-// Memory per idle slot:          TCP buffers (2 × 512 B, allocated at accept())
 
 #[cfg(feature = "tls")]
 async fn wait_for_worker_socket(
@@ -316,21 +286,8 @@ async fn wait_for_worker_socket(
         if let Some(socket) = socket_slot.take() {
             return socket;
         }
-
         ready.wait().await;
     }
-}
-
-#[cfg(feature = "tls")]
-fn log_tls_heap(stage: &str) {
-    let stats = HEAP.stats();
-    println!(
-        "[TLS HEAP {}] used={} free={} size={}",
-        stage,
-        stats.current_usage,
-        stats.size.saturating_sub(stats.current_usage),
-        stats.size
-    );
 }
 
 #[cfg(feature = "tls")]
@@ -369,11 +326,22 @@ async fn worker_busy_snapshot() -> [bool; MAX_TLS_CONNECTIONS] {
     snapshot
 }
 
+/// Pull 32 bytes of CSPRNG output from the shared TRNG, used as the server's
+/// random in the ServerHello. Brief lock held while we burst 8 × u32.
+#[cfg(feature = "tls")]
+async fn fresh_server_random(trng: &'static SharedTrng) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    let guard = trng.lock().await;
+    for chunk in bytes.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&guard.random().to_le_bytes());
+    }
+    bytes
+}
+
 #[cfg(feature = "tls")]
 async fn mqtt_tls_worker_body(
     slot: usize,
-    tls: &'static Tls<'static>,
-    tls_config: &'static SharedSessionConfig<'static>,
+    trng: &'static SharedTrng,
     socket_slot: &'static WorkerSocketSlot,
     busy_flag: &'static Mutex<CriticalSectionRawMutex, bool>,
     ready: &'static Signal<CriticalSectionRawMutex, ()>,
@@ -386,29 +354,23 @@ async fn mqtt_tls_worker_body(
             slot,
             socket.remote_endpoint()
         );
-        log_tls_heap("worker accepted");
 
+        let server_random = fresh_server_random(trng).await;
         let frame_buf = WORKER_FRAME_BUFFERS[slot].borrow();
         let tcp_transport = TcpTransport::new(&mut socket);
-        let mut transport = match TlsTransport::new(tls.reference(), tcp_transport, tls_config) {
-            Ok(transport) => transport,
-            Err(error) => {
-                log_tls_heap("session init failed");
-                println!("[TLS WORKER {}] Session init failed: {:?}", slot, error);
-                release_worker_slot(slot, busy_flag, "TLS WORKER").await;
-                continue;
-            }
-        };
-        log_tls_heap("session init ok");
 
-        if let Err(error) = transport.handshake().await {
-            log_tls_heap("handshake failed");
+        // Build the embedded-tls session and wrap it in gatomqtt's TlsTransport
+        // adapter so it can be fed straight into connection_loop.
+        let session: EmbeddedTlsPskSession<'_, _, TLS_SESSION_BUF> =
+            EmbeddedTlsPskSession::new(tcp_transport, psk_config(), server_random);
+        let mut transport = GatoTlsTransport::new(session);
+
+        if let Err(error) = transport.accept().await {
             println!("[TLS WORKER {}] Handshake failed: {:?}", slot, error);
             transport.close().await;
             release_worker_slot(slot, busy_flag, "TLS WORKER").await;
             continue;
         }
-        log_tls_heap("handshake ok");
         println!("[TLS WORKER {}] Handshake complete", slot);
 
         Box::pin(connection_loop(
@@ -423,7 +385,6 @@ async fn mqtt_tls_worker_body(
         .await;
 
         println!("[TLS WORKER {}] Connection closed", slot);
-        log_tls_heap("closed");
         release_worker_slot(slot, busy_flag, "TLS WORKER").await;
     }
 }
@@ -432,14 +393,10 @@ async fn mqtt_tls_worker_body(
 macro_rules! define_tls_worker_task {
     ($name:ident, $slot:expr) => {
         #[embassy_executor::task]
-        async fn $name(
-            tls: &'static Tls<'static>,
-            tls_config: &'static SharedSessionConfig<'static>,
-        ) {
+        async fn $name(trng: &'static SharedTrng) {
             mqtt_tls_worker_body(
                 $slot,
-                tls,
-                tls_config,
+                trng,
                 &WORKER_SOCKETS[$slot],
                 &WORKER_BUSY[$slot],
                 &WORKER_SIGNALS[$slot],
@@ -558,7 +515,6 @@ async fn plain_worker(stack: Stack<'static>) {
         .await;
 
         println!("[PLAIN WORKER] Connection closed");
-        // socket → bufs freed
     }
 }
 
@@ -566,23 +522,18 @@ async fn plain_worker(stack: Stack<'static>) {
 
 #[cfg(feature = "tls")]
 #[embassy_executor::task]
-async fn tls_runtime_task(
-    spawner: Spawner,
-    stack: Stack<'static>,
-    tls: &'static Tls<'static>,
-    tls_config: &'static SharedSessionConfig<'static>,
-) {
+async fn tls_runtime_task(spawner: Spawner, stack: Stack<'static>, trng: &'static SharedTrng) {
     println!(
-        "[MAIN] GatoMQTT port=8883 transport=tls max_connections={}",
+        "[MAIN] GatoMQTT port=8883 transport=tls (embedded-tls PSK_KE) max_connections={}",
         MAX_TLS_CONNECTIONS
     );
     if TLS_ENABLE_INBOUND_LOGGER {
         spawner.must_spawn(inbound_logger_task(&INBOUND_MUTEX));
     }
-    spawner.must_spawn(mqtt_tls_worker0_task(tls, tls_config));
-    spawner.must_spawn(mqtt_tls_worker1_task(tls, tls_config));
-    spawner.must_spawn(mqtt_tls_worker2_task(tls, tls_config));
-    spawner.must_spawn(mqtt_tls_worker3_task(tls, tls_config));
+    spawner.must_spawn(mqtt_tls_worker0_task(trng));
+    spawner.must_spawn(mqtt_tls_worker1_task(trng));
+    spawner.must_spawn(mqtt_tls_worker2_task(trng));
+    spawner.must_spawn(mqtt_tls_worker3_task(trng));
     spawner.must_spawn(mqtt_accept_task(stack));
     println!(
         "[MAIN] Spawned {} TLS workers + accept loop",
@@ -613,41 +564,13 @@ async fn main(spawner: Spawner) {
     let stack_resources = mk_static!(StackResources<STACK_SOCKETS>, StackResources::new());
 
     #[cfg(feature = "tls")]
-    let (mut tls, stack, mut accel): (Tls<'static>, Stack<'static>, _) =
-        bootstrap::bootstrap_stack(spawner, stack_resources).await;
+    let (stack, trng) = bootstrap::bootstrap_stack(spawner, stack_resources).await;
     #[cfg(not(feature = "tls"))]
-    let stack = bootstrap::bootstrap_stack(spawner, stack_resources).await;
+    let (stack, _trng) = bootstrap::bootstrap_stack(spawner, stack_resources).await;
 
     #[cfg(feature = "tls")]
     {
-        tls.set_debug(TLS_DEBUG_LEVEL);
-    }
-
-    #[cfg(feature = "tls")]
-    let _accel_queue = if TLS_USE_HW_ACCEL {
-        Some(accel.start())
-    } else {
-        None
-    };
-    #[cfg(feature = "tls")]
-    let tls = mk_static!(Tls, tls);
-    #[cfg(feature = "tls")]
-    let tls_config = mk_static!(
-        SharedSessionConfig<'static>,
-        SharedSessionConfig::new(&mqtt_server_config()).unwrap()
-    );
-
-    #[cfg(feature = "tls")]
-    {
-        println!(
-            "[MAIN] TLS HW accel: {}",
-            if TLS_USE_HW_ACCEL {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        );
-        spawner.must_spawn(tls_runtime_task(spawner, stack, tls, tls_config));
+        spawner.must_spawn(tls_runtime_task(spawner, stack, trng));
     }
 
     #[cfg(not(feature = "tls"))]

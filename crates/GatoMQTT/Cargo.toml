@@ -1,0 +1,33 @@
+[package]
+name = "GatoMQTT"
+version = "0.1.0"
+edition = "2021"
+description = "GatoMQTT local no_std MQTT 3.1.1 broker"
+license = "MIT"
+repository = "https://github.com/babasha/picobrokerTLS"
+keywords = ["mqtt", "broker", "embedded", "no_std", "gatomqtt"]
+categories = ["network-programming", "embedded", "parser-implementations"]
+readme = "./README.md"
+
+[features]
+embassy-net = ["dep:embassy-net"]
+# Server-mode TLS 1.3 PSK_KE adapter using the vendored GatoPSKTLS fork.
+# Enables `crate::tls::embedded_tls_psk` which implements `TlsSession`.
+tls-psk = ["dep:gatopsktls"]
+
+[dependencies]
+mqttrs = { version = "0.4", default-features = false }
+heapless = "0.8"
+heapless07 = { package = "heapless", version = "0.7.17" }
+embassy-sync = { version = "0.7", features = ["defmt"] }
+embassy-futures = "0.1"
+embassy-time = { version = "0.5" }
+defmt = "1.0.1"
+sha2 = { version = "0.10", default-features = false }
+embassy-net = { version = "0.8", features = ["tcp"], optional = true }
+gatopsktls = { package = "GatoPSKTLS", path = "../GatoPSKTLS", default-features = false, optional = true }
+
+[dev-dependencies]
+embassy-time = { version = "0.5", features = ["std", "generic-queue-8"] }
+futures = "0.3"
+critical-section = { version = "1.2", features = ["std"] }

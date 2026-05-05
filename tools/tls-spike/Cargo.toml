@@ -1,0 +1,13 @@
+[package]
+name = "tls-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+sha2 = "0.10"
+hmac = "0.12"
+hex-literal = "0.4"
+x25519-dalek = { version = "2", features = ["static_secrets"] }

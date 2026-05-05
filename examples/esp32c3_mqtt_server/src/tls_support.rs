@@ -1,4 +1,4 @@
-use mbedtls_rs::{PreSharedKey, ServerSessionConfig, SessionConfig, TlsVersion};
+use gatomqtt::tls::embedded_tls_psk::PskConfig;
 
 const MQTT_PSK_IDENTITY: &[u8] = b"gatomqtt-psk";
 const MQTT_PSK_KEY: &[u8] = &[
@@ -6,10 +6,11 @@ const MQTT_PSK_KEY: &[u8] = &[
     0x13, 0xF7, 0xA9, 0x3C, 0x58, 0xDE, 0x71, 0x24, 0x8B, 0xC6, 0x4A, 0x91, 0x05, 0xEF, 0x36, 0x7D,
 ];
 
-pub fn mqtt_server_config() -> SessionConfig<'static> {
-    let mut config =
-        ServerSessionConfig::new_psk(PreSharedKey::new(MQTT_PSK_IDENTITY, MQTT_PSK_KEY));
-    config.min_version = TlsVersion::Tls1_3;
-
-    SessionConfig::Server(config)
+/// Server-side PSK config for the embedded-tls handshake. Identity matches the
+/// existing test client setup in `tools/Run-Tls13PskHandshake.ps1`.
+pub fn psk_config() -> PskConfig<'static> {
+    PskConfig {
+        identity: MQTT_PSK_IDENTITY,
+        secret: MQTT_PSK_KEY,
+    }
 }

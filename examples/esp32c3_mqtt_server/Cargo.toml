@@ -14,7 +14,7 @@ esp-bootloader-esp-idf = { path = "../../third_party/esp-hal/esp-bootloader-esp-
 esp-metadata-generated = { path = "../../third_party/esp-hal/esp-metadata-generated" }
 
 [dependencies]
-gatomqtt = { package = "GatoMQTT", path = "../../" }
+gatomqtt = { package = "GatoMQTT", path = "../../crates/GatoMQTT", default-features = false }
 embassy-sync = { version = "0.7", features = ["defmt"] }
 embassy-time = "0.5"
 embassy-executor = "0.9"
@@ -24,7 +24,8 @@ defmt = "1.0.1"
 embedded-io = "0.7"
 mqttrs = { version = "0.4", default-features = false }
 log = { version = "0.4", default-features = false }
-mbedtls-rs = { path = "../../vendor/mbedtls-rs/mbedtls-rs", default-features = false, features = ["log", "force-esp-riscv-gcc"], optional = true }
+rand_core = { version = "0.6", default-features = false }
+gatopsktls = { package = "GatoPSKTLS", path = "../../crates/GatoPSKTLS", default-features = false, optional = true }
 esp-hal = { version = "1.0.0", features = ["esp32c3", "unstable", "exception-handler", "log-04"] }
 esp-backtrace = { version = "0.18.1", features = ["esp32c3", "panic-handler", "println"] }
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32c3"] }
@@ -38,7 +39,9 @@ tinyrlibc = { version = "0.5", default-features = false, features = ["memchr"] }
 
 [features]
 default = []
-tls = ["dep:mbedtls-rs", "mbedtls-rs/esp32c3", "mbedtls-rs/embassy-time"]
+# TLS 1.3 PSK_KE server using the vendored embedded-tls fork.
+# (Replaces mbedtls-rs from prior versions of this example.)
+tls = ["dep:gatopsktls", "gatomqtt/tls-psk"]
 
 [profile.release]
 opt-level = "z"

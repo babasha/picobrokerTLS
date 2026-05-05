@@ -1,6 +1,9 @@
 use heapless::{String, Vec};
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "tls-psk")]
+pub mod embedded_tls_psk;
+
 pub const MAX_CERTIFICATE_DER_LEN: usize = 1024;
 pub const MAX_PRIVATE_KEY_DER_LEN: usize = 256;
 pub const FINGERPRINT_HEX_LEN: usize = 95;
