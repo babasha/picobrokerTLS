@@ -8,7 +8,7 @@ description = "Host-side tokio TCP wrapper around embedded-tls server-mode primi
 [workspace]
 
 [dependencies]
-gatopsktls = { package = "GatoPSKTLS", path = "../../crates/GatoPSKTLS" }
+gatopsktls = { package = "GatoPSKTLS", path = "../../../GitHub/GatoPSKTLS" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net"] }
 anyhow = "1"
 env_logger = "0.11"

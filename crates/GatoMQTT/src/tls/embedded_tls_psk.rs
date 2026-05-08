@@ -28,7 +28,15 @@
 use core::convert::Infallible;
 
 use gatopsktls::TlsError;
-use gatopsktls::server::{TlsServerConfig, TlsServerSession};
+use gatopsktls::alert::{AlertDescription, AlertLevel};
+use gatopsktls::server::{
+    AppDataOrAlert, HandshakeOutput, TlsServerConfig, TlsServerSession,
+};
+
+// Re-export so callers can build `PskConfig.dhe_keypair` without
+// depending on `gatopsktls` directly. Name shadows the symbol used
+// internally below — both refer to the same type.
+pub use gatopsktls::server::DheKeyShare;
 
 use crate::transport::Transport;
 use crate::transport::tls::TlsSession;
@@ -39,9 +47,6 @@ const TLS_CT_CHANGE_CIPHER_SPEC: u8 = 20;
 const TLS_CT_ALERT: u8 = 21;
 const TLS_CT_HANDSHAKE: u8 = 22;
 const TLS_CT_APPLICATION_DATA: u8 = 23;
-
-const ALERT_LEVEL_WARNING: u8 = 1;
-const ALERT_DESCRIPTION_CLOSE_NOTIFY: u8 = 0;
 
 /// Errors returned by the embedded-tls PSK adapter.
 #[derive(Debug)]
@@ -71,12 +76,25 @@ impl<E: core::fmt::Debug> SessionError<E> {
 }
 
 /// PSK handshake configuration for a single inbound connection.
-#[derive(Debug, Clone, Copy)]
+///
+/// `dhe_keypair = None` keeps the legacy `psk_ke`-only behaviour
+/// (forward-secrecy-less, but cheap). `dhe_keypair = Some(_)` enables
+/// `psk_dhe_ke` when the client offers it — required for interop with
+/// stock OpenSSL/mosquitto, which won't negotiate plain `psk_ke` without
+/// `-allow_no_dhe_kex`. Generate a fresh keypair per connection via
+/// [`DheKeyShare::generate`]; reusing one across sessions defeats
+/// forward secrecy.
+///
+/// Note: deliberately not `Debug` — `secret` and `dhe_keypair` would
+/// expose key material via accidental `{:?}` logging.
+#[derive(Clone)]
 pub struct PskConfig<'cfg> {
     /// PSK identity sent by clients on the wire (e.g. `b"gatomqtt-psk"`).
     pub identity: &'cfg [u8],
     /// PSK secret bytes (32 bytes for SHA-256-based suites).
     pub secret: &'cfg [u8],
+    /// Optional ephemeral X25519 keypair for `psk_dhe_ke`. See module docs.
+    pub dhe_keypair: Option<DheKeyShare>,
 }
 
 /// Adapter that exposes a [`TlsSession`] over the vendored embedded-tls
@@ -180,29 +198,83 @@ where
         self.record_buf[0]
     }
 
-    /// Drive the server-side TLS 1.3 PSK_KE handshake to completion using
-    /// the bytes-in/bytes-out primitives in `embedded_tls::server`.
+    /// Drive the server-side TLS 1.3 (PSK_KE or PSK_DHE_KE) handshake to
+    /// completion. Loops over `process_client_hello` to handle a single
+    /// HelloRetryRequest round-trip when the client offers `psk_dhe_ke`
+    /// without a usable X25519 share — required for interop with stock
+    /// OpenSSL/mosquitto, which always wraps PSK with DHE for forward
+    /// secrecy.
     async fn do_accept(&mut self) -> Result<(), SessionError<T::Error>> {
-        // ── 1. ClientHello (TLSPlaintext Handshake). ─────────────────────
+        // CH1 → server first flight, with at most one HRR round-trip
+        // for the case where the client offered psk_dhe_ke without a
+        // usable X25519 share. Per RFC 8446 §4.1.4 the server may emit
+        // exactly one HRR per handshake.
+        //
+        // 1) Read CH1.
         self.fetch_record().await?;
         if self.record_type() != TLS_CT_HANDSHAKE {
             return Err(SessionError::UnexpectedRecordType(self.record_type()));
         }
-        let ch_handshake_len = self.record_len - RECORD_HEADER_LEN;
-
-        // ── 2. Process CH → emit first flight (SH + EE + Finished). ──────
-        let flight_len = {
-            let ch_handshake =
-                &self.record_buf[RECORD_HEADER_LEN..RECORD_HEADER_LEN + ch_handshake_len];
-            let cfg = TlsServerConfig {
-                psk: (self.config.identity, self.config.secret),
-                server_random: self.server_random,
-            };
-            self.inner
-                .process_client_hello(ch_handshake, &cfg, &mut self.out_buf)
-                .map_err(SessionError::from_tls)?
-                .len()
+        let ch1_len = self.record_len - RECORD_HEADER_LEN;
+        let cfg = TlsServerConfig {
+            psk: (self.config.identity, self.config.secret),
+            server_random: self.server_random,
+            dhe_keypair: self.config.dhe_keypair.clone(),
         };
+        let flight_len = match self
+            .inner
+            .process_client_hello(
+                &self.record_buf[RECORD_HEADER_LEN..RECORD_HEADER_LEN + ch1_len],
+                &cfg,
+                &mut self.out_buf,
+            )
+            .map_err(SessionError::from_tls)?
+        {
+            HandshakeOutput::FirstFlight(bytes) => bytes.len(),
+            HandshakeOutput::HelloRetryRequest(bytes) => {
+                // 2a) Write HRR.
+                let hrr_len = bytes.len();
+                self.transport
+                    .write(&self.out_buf[..hrr_len])
+                    .await
+                    .map_err(SessionError::Transport)?;
+                // 2b) Drain dummy CCS records (RFC 8446 §D.4).
+                loop {
+                    self.fetch_record().await?;
+                    match self.record_type() {
+                        TLS_CT_CHANGE_CIPHER_SPEC => continue,
+                        TLS_CT_HANDSHAKE => break,
+                        other => {
+                            return Err(SessionError::UnexpectedRecordType(other));
+                        }
+                    }
+                }
+                // 2c) Process CH2. Same session — it remembers internally
+                //     that one HRR has been issued and rejects a second
+                //     per RFC 8446 §4.1.4 / §4.1.2.
+                let ch2_len = self.record_len - RECORD_HEADER_LEN;
+                let cfg2 = TlsServerConfig {
+                    psk: (self.config.identity, self.config.secret),
+                    server_random: self.server_random,
+                    dhe_keypair: self.config.dhe_keypair.clone(),
+                };
+                match self
+                    .inner
+                    .process_client_hello(
+                        &self.record_buf[RECORD_HEADER_LEN..RECORD_HEADER_LEN + ch2_len],
+                        &cfg2,
+                        &mut self.out_buf,
+                    )
+                    .map_err(SessionError::from_tls)?
+                {
+                    HandshakeOutput::FirstFlight(b) => b.len(),
+                    HandshakeOutput::HelloRetryRequest(_) => {
+                        return Err(SessionError::from_tls(TlsError::InvalidHandshake));
+                    }
+                }
+            }
+        };
+
         self.transport
             .write(&self.out_buf[..flight_len])
             .await
@@ -230,9 +302,13 @@ where
     }
 
     /// Pull one application-phase record off the wire, decrypt it into
-    /// `plain_buf`, and update `plain_len`/`plain_offset`. Tolerates and skips
-    /// CCS dummies. Treats inbound close_notify alerts as a clean EOF by
-    /// setting `closed = true`.
+    /// `plain_buf`, and update `plain_len`/`plain_offset`. Tolerates and
+    /// skips CCS dummies. A peer-initiated `close_notify` (RFC 8446 §6 —
+    /// encrypted Alert with inner CT = 21) is reported as `Closed` so the
+    /// `read` path can return EOF cleanly. A non-`close_notify` Alert
+    /// (e.g. peer reporting a fatal error) also triggers `Closed`; the
+    /// extra detail is logged via the level/description but the session
+    /// just shuts down either way for the v1 contract.
     async fn refill_plaintext(&mut self) -> Result<(), SessionError<T::Error>> {
         loop {
             self.fetch_record().await?;
@@ -241,9 +317,9 @@ where
                 TLS_CT_CHANGE_CIPHER_SPEC => continue,
                 TLS_CT_APPLICATION_DATA => break,
                 TLS_CT_ALERT => {
-                    // Peer aborted (might be close_notify wrapped as alert
-                    // record before we switched to encrypted mode — rare, but
-                    // be defensive).
+                    // Plaintext Alert at the outer record level — only
+                    // legal pre-handshake (i.e. never on this code path,
+                    // which runs after handshake completion). Be defensive.
                     self.closed = true;
                     return Err(SessionError::Closed);
                 }
@@ -251,20 +327,26 @@ where
             }
         }
 
-        // decrypt_app_data refuses non-ApplicationData inner content types.
-        // For a graceful peer close_notify (sent encrypted as inner Alert)
-        // we'd want to treat it as EOF rather than an error. We attempt
-        // decrypt; if it succeeds we have plaintext app data, if it errors
-        // out we surface it.
         let record_len = self.record_len;
-        let len = self
+        match self
             .inner
-            .decrypt_app_data(&self.record_buf[..record_len], &mut self.plain_buf)
+            .decrypt_app_data_or_alert(&self.record_buf[..record_len], &mut self.plain_buf)
             .map_err(SessionError::from_tls)?
-            .len();
-        self.plain_len = len;
-        self.plain_offset = 0;
-        Ok(())
+        {
+            AppDataOrAlert::AppData(plaintext) => {
+                let len = plaintext.len();
+                self.plain_len = len;
+                self.plain_offset = 0;
+                Ok(())
+            }
+            AppDataOrAlert::Alert { .. } => {
+                // Peer signalled close (close_notify) or a fatal error.
+                // Either way the session is done — surface as a clean
+                // close so the reader returns EOF.
+                self.closed = true;
+                Err(SessionError::Closed)
+            }
+        }
     }
 }
 
@@ -347,14 +429,19 @@ where
             self.transport.close().await;
             return;
         }
-        // Build a TLSCiphertext close_notify alert: inner = AlertLevel + Desc
-        // (2 bytes) || ContentType::Alert marker (1 byte). encrypt_app_data
-        // wraps with ApplicationData inner CT, so it isn't quite right here —
-        // for a v1 best-effort close, just drop the socket. Proper alert
-        // emission needs a dedicated helper inside `embedded_tls::server`,
-        // tracked as a TODO.
-        let _ = ALERT_LEVEL_WARNING; // keep constant referenced
-        let _ = ALERT_DESCRIPTION_CLOSE_NOTIFY;
+        // Emit a proper TLS 1.3 close_notify (RFC 8446 §6.1): warning-level
+        // Alert wrapped in an outer ApplicationData TLSCiphertext under
+        // the application traffic keys. Best-effort — if encrypt or
+        // socket write fails we still close the transport so resources
+        // get released.
+        if let Ok(record) = self.inner.encrypt_alert(
+            AlertLevel::Warning,
+            AlertDescription::CloseNotify,
+            &mut self.out_buf,
+        ) {
+            let len = record.len();
+            let _ = self.transport.write(&self.out_buf[..len]).await;
+        }
         self.transport.close().await;
     }
 }

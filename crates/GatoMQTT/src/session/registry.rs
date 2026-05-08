@@ -1,4 +1,5 @@
 use super::state::{LwtMessage, SessionId, SessionState, StoredPublishHandle};
+use crate::slot::Slot;
 use heapless::{Deque, String, Vec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,9 +15,9 @@ pub enum RegistryError {
 
 #[derive(Debug, Clone)]
 pub struct SessionRegistry<const N: usize, const MAX_SUBS: usize, const MAX_INFLIGHT: usize> {
-    slots: [Option<SessionState<MAX_SUBS, MAX_INFLIGHT>>; N],
+    slots: [Slot<SessionState<MAX_SUBS, MAX_INFLIGHT>>; N],
     published_lwts: Deque<LwtMessage, N>,
-    stored_publishes: [Option<StoredPublish>; MAX_INFLIGHT],
+    stored_publishes: [Slot<StoredPublish>; MAX_INFLIGHT],
     next_publish_generation: u32,
 }
 
@@ -58,9 +59,9 @@ impl<const N: usize, const MAX_SUBS: usize, const MAX_INFLIGHT: usize>
 {
     pub const fn new() -> Self {
         Self {
-            slots: [const { None }; N],
+            slots: [const { Slot::EMPTY }; N],
             published_lwts: Deque::new(),
-            stored_publishes: [const { None }; MAX_INFLIGHT],
+            stored_publishes: [const { Slot::EMPTY }; MAX_INFLIGHT],
             next_publish_generation: 1,
         }
     }
@@ -70,7 +71,7 @@ impl<const N: usize, const MAX_SUBS: usize, const MAX_INFLIGHT: usize>
         state: SessionState<MAX_SUBS, MAX_INFLIGHT>,
     ) -> Result<SessionId, RegistryError> {
         if let Some((id, slot)) = self.slots.iter_mut().enumerate().find(|(_, slot)| slot.is_none()) {
-            *slot = Some(state);
+            slot.replace(state);
             Ok(id)
         } else {
             Err(RegistryError::Full)
@@ -78,15 +79,15 @@ impl<const N: usize, const MAX_SUBS: usize, const MAX_INFLIGHT: usize>
     }
 
     pub fn get(&self, id: SessionId) -> Option<&SessionState<MAX_SUBS, MAX_INFLIGHT>> {
-        self.slots.get(id).and_then(Option::as_ref)
+        self.slots.get(id).and_then(Slot::as_ref)
     }
 
     pub fn get_mut(&mut self, id: SessionId) -> Option<&mut SessionState<MAX_SUBS, MAX_INFLIGHT>> {
-        self.slots.get_mut(id).and_then(Option::as_mut)
+        self.slots.get_mut(id).and_then(Slot::as_mut)
     }
 
     pub fn remove(&mut self, id: SessionId) -> Option<SessionState<MAX_SUBS, MAX_INFLIGHT>> {
-        let removed = self.slots.get_mut(id).and_then(Option::take)?;
+        let removed = self.slots.get_mut(id).and_then(Slot::take)?;
         for entry in &removed.inflight {
             self.release_stored_publish(entry.publish);
         }
@@ -158,7 +159,7 @@ impl<const N: usize, const MAX_SUBS: usize, const MAX_INFLIGHT: usize>
             self.next_publish_generation = 1;
         }
 
-        *stored = Some(StoredPublish {
+        stored.replace(StoredPublish {
             topic: String::<128>::try_from(topic).map_err(|_| RegistryError::PublishTopicTooLong)?,
             payload: Vec::<u8, 512>::from_slice(payload)
                 .map_err(|_| RegistryError::PublishPayloadTooLarge)?,
@@ -190,7 +191,7 @@ impl<const N: usize, const MAX_SUBS: usize, const MAX_INFLIGHT: usize>
         };
         stored.refcount = stored.refcount.saturating_sub(1);
         if stored.refcount == 0 {
-            self.stored_publishes[handle.slot] = None;
+            self.stored_publishes[handle.slot].take();
         }
     }
 

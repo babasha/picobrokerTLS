@@ -114,14 +114,22 @@ async fn handle_connection(
     let config = TlsServerConfig {
         psk: (identity, psk),
         server_random,
+        dhe_keypair: None,
     };
     let mut session = TlsServerSession::new();
     let mut out = vec![0u8; 4 * 1024];
     let flight_len = {
-        let flight = session
+        let out_bytes = session
             .process_client_hello(ch_handshake, &config, &mut out)
             .map_err(|e| anyhow::anyhow!("process_client_hello: {e:?}"))?;
-        flight.len()
+        // GatoPSKTLS 0.2: returns HandshakeOutput; quick interop tester
+        // doesn't bother with HRR loop, so reject HRR explicitly.
+        match out_bytes {
+            gatopsktls::server::HandshakeOutput::FirstFlight(b) => b.len(),
+            gatopsktls::server::HandshakeOutput::HelloRetryRequest(_) => {
+                bail!("server emitted HRR — interop tester doesn't support HRR loop");
+            }
+        }
     };
     stream
         .write_all(&out[..flight_len])

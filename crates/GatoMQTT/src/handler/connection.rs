@@ -119,7 +119,8 @@ pub async fn connection_loop<
             password: config.house_token_password,
         };
 
-        match prepare_connect(&mut registry, &connect, &token) {
+        let prep = prepare_connect(&mut registry, &connect, &token);
+        match prep {
             Ok(PreparedConnect::Accepted(outcome)) => {
                 let session_id = outcome.session_id;
                 if let Some(session) = registry.get_mut(session_id) {

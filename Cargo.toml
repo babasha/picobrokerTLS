@@ -12,3 +12,10 @@ exclude = [
     "tools/host_tls_psk_server",
 ]
 resolver = "2"
+
+# Local development override: while iterating on GatoPSKTLS in the sibling
+# repo, point cargo at the working tree instead of the published 0.1
+# release. Drop this section before tagging a release that bumps the
+# crates.io version pin.
+[patch.crates-io]
+GatoPSKTLS = { path = "../GitHub/GatoPSKTLS" }
